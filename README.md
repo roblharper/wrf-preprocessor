@@ -45,7 +45,7 @@ NetCDF sources ─▶ reader ─▶ (derive) ─▶ sync ─▶ normalize ─▶
 | Stage | File | Job |
 |-------|------|-----|
 | **Reader** | `reader.py` | Stream any NetCDF in chunks (memory-safe); map raw variables to canonical columns by dimension name. |
-| **Processor** | `processor.py` | Run a source's `derive` hook (computed columns), assemble canonical rows, then normalize (swappable `Normalizer`). |
+| **Processor** | `processor.py` | Run a source's `derive` hook (computed columns), assemble canonical rows, then normalize. |
 | **Sync** | `sync.py` | Split HRRR into per-snapshot bundles; attach LES/sensor rows by time window + bbox; drop the rest. |
 | **Writer** | `writer.py` | One `.npy` per snapshot + shared `metadata.json`. |
 | **Orchestrator** | `orchestrator.py` | Thin wiring of the above + CLI. |
@@ -65,7 +65,7 @@ A record declares how a source's files map onto the canonical schema:
 SourceType(
     name="my instrument",       # human name (logs / metadata)
     match="myinst",             # filename substring; discovery matches by this
-    role=OBSERVATION,           # ANCHOR (HRRR) | INTERIOR (LES) | OBSERVATION
+    is_anchor=False,            # True only for HRRR (defines the snapshots)
     column_map={                # direct canonical -> raw-variable renames
         "x": "lon", "y": "lat", "z": "alt",
         "u": "wind_u", "v": "wind_v",
@@ -98,11 +98,12 @@ matching no record are reported and skipped, never silently forced.
 
 ```bash
 # point at a folder tree of NetCDF files; get per-snapshot .npy + metadata
-python orchestrator.py <input_root> <out_dir> [--chunk-size N]
+python orchestrator.py <input_root> <out_dir> [--chunk-size N] [-v | -vv]
 ```
 
 `<input_root>` is any folder tree of `.nc` / `.cdf` files (in-flight suffixes
-like `.cdf.v1` are ignored). Output:
+like `.cdf.v1` are ignored). Logging is silent by default; `-v` shows the sync
+summary and skipped files, `-vv` shows per-block filtering detail. Output:
 
 ```
 <out_dir>/
@@ -143,6 +144,6 @@ Python with `numpy` and `netCDF4`. (Runs against the project's `ML_venv`.)
   data, not yet on the real files. Unifying the frames is the next step.
 - **Variable adaptation is partial** (e.g. FastEddy `theta -> T`, deriving
   density) — the hooks exist; the specific conversions are added as needed.
-- **Normalization** is a simple per-column max (`MaxNormalizer`), swappable via
-  the `Normalizer` strategy once the group settles the real scheme.
+- **Normalization** is a placeholder per-column max (the `Normalizer` class);
+  replace its body once the group settles the real scheme.
 - **Parallel reads** are designed for (chunks are independent) but not built.
