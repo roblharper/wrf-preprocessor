@@ -1,18 +1,4 @@
-"""Output stage: one ``.npy`` per HRRR snapshot + a shared metadata sidecar.
-
-Layout (matches the ``Case`` interface the PINN expects):
-
-    <out_dir>/
-        metadata.json          schema + global normalization recipe (shared)
-        <snapshot_id>.npy      one file per HRRR snapshot; canonical column order
-        ...
-
-so the PINN's ``read_case(name, root)`` is just "load ``root/<name>.npy``".
-
-The per-case grouping is decided upstream by the syncing stage (one bundle per
-HRRR snapshot). This writer just serializes those bundles. Normalization is
-global: one recipe, recorded once, already applied to every bundle.
-"""
+"""Write one ``.npy`` per HRRR snapshot + a shared ``metadata.json``."""
 
 from __future__ import annotations
 
@@ -66,10 +52,8 @@ def _write_metadata(
         "normalization": normalization_recipe,
         "cases": {p.stem: int(cases[p.stem].shape[0]) for p in written},
         "known_limitations": [
-            "Coordinate frames are NOT yet reconciled across sources: HRRR and "
-            "sensor x/y are lon/lat in degrees, simulation x/y are metres, z mixes "
-            "geopotential height and metres. Cross-source rows in one snapshot are "
-            "matched by raw x/y until the reconciliation step is implemented.",
+            "Coordinate frames not yet reconciled: HRRR/sensor x/y in degrees, "
+            "LES in metres, z mixes geopotential height and metres.",
         ],
     }
     (out_dir / "metadata.json").write_text(json.dumps(metadata, indent=2))

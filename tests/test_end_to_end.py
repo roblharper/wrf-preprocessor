@@ -1,16 +1,4 @@
-"""End-to-end test of the pre-processor's universal syncing behavior.
-
-Generates phony NetCDF data (HRRR / LES / sensor) with a small fraction of rows
-deliberately off in time and/or space, runs the full pipeline, and asserts:
-
-  * one .npy is written per HRRR snapshot, plus a shared metadata.json;
-  * every row in a snapshot file is within the time tolerance AND spatial bbox
-    of that snapshot -- i.e. off-time / off-location junk was dropped;
-  * the off-location sensor station never appears in any output;
-  * normalization is global (one recipe over all synced rows).
-
-Run: pytest  (from the preprocessor/ directory)
-"""
+"""End-to-end test: phony data in, synced per-snapshot .npy out."""
 
 from __future__ import annotations
 
@@ -21,14 +9,14 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-# Make the preprocessor modules importable when pytest runs from anywhere.
+# Make the preprocessor modules + fixtures importable regardless of CWD.
 _PKG = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_PKG))
 sys.path.insert(0, str(_PKG / "fixtures"))
 
-from config import COLUMN_INDEX, TIME_TOLERANCE_SECONDS, source_for, ANCHOR_SOURCE
-from reader import iter_source_files, read_file
-from processor import assemble
+from config import COLUMN_INDEX, TIME_TOLERANCE_SECONDS
+from reader import discover_files, read_file
+from processor import to_canonical
 from sync import build_snapshots, attach_data
 import orchestrator
 import generate_phony_data as gen
@@ -46,16 +34,14 @@ def phony(tmp_path):
 
 
 def _raw_snapshots(root: Path):
-    """Re-run the sync stage on raw (un-normalized) rows, for value assertions."""
+    """Re-run read -> canonical -> sync on raw (un-normalized) rows."""
 
     anchor, data = [], []
-    for key in ("hrrr", "simulation", "sensor"):
-        src = source_for(key)
-        for p in iter_source_files(root / key):
-            for ch in read_file(p, src, chunk_size=50):
-                b = assemble(ch)
-                if b.size:
-                    (anchor if key == ANCHOR_SOURCE else data).append(b)
+    for path, src in discover_files(root):
+        for ch in read_file(path, src, chunk_size=50):
+            b = to_canonical(ch, src)
+            if b.size:
+                (anchor if src.is_anchor else data).append(b)
     snaps = build_snapshots(anchor)
     kept, dropped = attach_data(snaps, data)
     return snaps, kept, dropped
@@ -64,7 +50,7 @@ def _raw_snapshots(root: Path):
 def test_pipeline_writes_one_npy_per_snapshot(phony, tmp_path):
     root, manifest = phony
     out = tmp_path / "out"
-    written = orchestrator.run(root, out, chunk_size=50, verbose=False)
+    written = orchestrator.run(root, out, chunk_size=50)
 
     # two distinct HRRR times -> two snapshots + metadata.json
     assert len(written) == 2
@@ -112,7 +98,7 @@ def test_off_time_snapshot_has_no_sync_time_data(phony):
 def test_normalization_is_global(phony, tmp_path):
     root, _ = phony
     out = tmp_path / "out"
-    orchestrator.run(root, out, chunk_size=50, verbose=False)
+    orchestrator.run(root, out, chunk_size=50)
 
     meta = json.loads((out / "metadata.json").read_text())
     # one global recipe with a scale per canonical column
@@ -124,3 +110,58 @@ def test_normalization_is_global(phony, tmp_path):
         d = np.load(out / f"{name}.npy")
         finite = d[np.isfinite(d)]
         assert np.all(np.abs(finite) <= 1.0 + 1e-9), f"{name}: values exceed global scale"
+
+
+# --- multi-type registry: discovery, derive hooks, unmapped types ------------
+def test_discovery_matches_multiple_instrument_types(phony):
+    """Every structural type is discovered by filename, across a mixed folder."""
+
+    root, _ = phony
+    matched = {src.match for _, src in discover_files(root)}
+    # at least the anchor, interior, and several observation types are present
+    for expected in ("hrrr", "les", "ecorsfwind", "smos", "twr", "co2flx",
+                     "armbeatm", "dlaux"):
+        assert expected in matched, f"{expected} not discovered"
+
+
+def test_derive_hooks_produce_correct_canonical_values(phony):
+    """ARM time (base+offset), smos speed/dir -> u,v, and twr Celsius -> Kelvin."""
+
+    root, _ = phony
+    obs = root / "obs"
+
+    def first_canonical(match_glob):
+        from config import match_source
+        p = next((obs).glob(match_glob))
+        src = match_source(p.name)
+        for ch in read_file(p, src, chunk_size=50):
+            b = to_canonical(ch, src)
+            if b.size:
+                return b
+        return None
+
+    # ARM absolute time is epoch-scale, not seconds-since-midnight.
+    ecor = first_canonical("ecorsfwind_a*")
+    assert ecor[0, _T] > 1_000_000_000, "ecor t is not an absolute epoch time"
+
+    # smos: wspd=5, wdir=270 (from the west) -> u ~ +5, v ~ 0.
+    U, V = COLUMN_INDEX["u"], COLUMN_INDEX["v"]
+    smos = first_canonical("smos_a*")
+    assert abs(smos[0, U] - 5.0) < 0.5 and abs(smos[0, V]) < 0.5
+
+    # twr: 18 C -> ~291 K.
+    Tc = COLUMN_INDEX["T"]
+    twr = first_canonical("twr25m*")
+    assert 288.0 < twr[0, Tc] < 294.0
+
+
+def test_unmapped_type_contributes_no_rows(phony):
+    """A canonical=False type (dlaux) is recognized but adds no canonical rows."""
+
+    from config import match_source
+    root, _ = phony
+    p = next((root / "obs").glob("dlaux_a*"))
+    src = match_source(p.name)
+    assert src is not None and src.canonical is False
+    rows = [to_canonical(ch, src) for ch in read_file(p, src, chunk_size=50)]
+    assert all(b.shape[0] == 0 for b in rows), "unmapped type produced rows"

@@ -1,29 +1,19 @@
-"""Syncing stage: bundle each HRRR snapshot with the data that belongs to it.
+"""Bundle each HRRR snapshot with the LES/sensor rows that belong to it.
 
-A case is one HRRR snapshot. This stage groups all assembled rows into
-per-snapshot bundles:
-
-  * The HRRR rows are split into snapshots by their ``t`` value (one HRRR file
-    holds many forecast times; each distinct time is a snapshot).
-  * For every snapshot, LES / sensor rows are kept only if they fall within the
-    time-tolerance window of the snapshot time AND inside the snapshot's spatial
-    bounding box (its x/y extent). Rows matching no snapshot are dropped.
-
-The result is one array per snapshot: HRRR interior + the co-located, co-temporal
-LES / sensor rows, ready to normalize and write.
+A row belongs to a snapshot if it is within the time window and inside the
+snapshot's x/y bbox; rows matching no snapshot are dropped.
 """
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 
 import numpy as np
 
-from config import (
-    ANCHOR_SOURCE,
-    COLUMN_INDEX,
-    TIME_TOLERANCE_SECONDS,
-)
+from config import COLUMN_INDEX, TIME_TOLERANCE_SECONDS
+
+log = logging.getLogger(__name__)
 
 _T = COLUMN_INDEX["t"]
 _X = COLUMN_INDEX["x"]
@@ -34,7 +24,7 @@ _Y = COLUMN_INDEX["y"]
 class Snapshot:
     """One HRRR snapshot and the data synced to it."""
 
-    time: float                              # snapshot time (canonical t)
+    time: float
     bbox: tuple[float, float, float, float]  # x_min, x_max, y_min, y_max
     blocks: list[np.ndarray] = field(default_factory=list)
 
@@ -42,24 +32,10 @@ class Snapshot:
         return np.vstack(self.blocks)
 
 
-def _snapshot_id(time: float) -> str:
-    """Stable, filename-safe id for a snapshot time (epoch seconds)."""
-
-    return f"hrrr_t{int(round(time))}"
-
-
 def build_snapshots(anchor_blocks: list[np.ndarray]) -> dict[str, Snapshot]:
-    """Split HRRR (anchor) rows into per-snapshot bundles keyed by snapshot id.
-
-    Each distinct HRRR ``t`` becomes a snapshot; its bounding box is the x/y
-    extent of that snapshot's own rows.
-    """
-
+    """One snapshot per distinct HRRR time; bbox = that time's x/y extent."""
     if not anchor_blocks:
-        raise RuntimeError(
-            f"No '{ANCHOR_SOURCE}' rows found; a case needs an HRRR snapshot to "
-            f"anchor it. (Is the '{ANCHOR_SOURCE}/' input folder present?)"
-        )
+        raise RuntimeError("No anchor (HRRR) rows found; a case needs an HRRR snapshot.")
     hrrr = np.vstack(anchor_blocks)
 
     snapshots: dict[str, Snapshot] = {}
@@ -69,15 +45,8 @@ def build_snapshots(anchor_blocks: list[np.ndarray]) -> dict[str, Snapshot]:
             float(np.nanmin(rows[:, _X])), float(np.nanmax(rows[:, _X])),
             float(np.nanmin(rows[:, _Y])), float(np.nanmax(rows[:, _Y])),
         )
-        snap = Snapshot(time=float(t), bbox=bbox, blocks=[rows])
-        snapshots[_snapshot_id(float(t))] = snap
+        snapshots[f"hrrr_t{int(round(t))}"] = Snapshot(float(t), bbox, [rows])
     return snapshots
-
-
-def _within_bbox(rows: np.ndarray, bbox: tuple[float, float, float, float]) -> np.ndarray:
-    x_min, x_max, y_min, y_max = bbox
-    x, y = rows[:, _X], rows[:, _Y]
-    return (x >= x_min) & (x <= x_max) & (y >= y_min) & (y <= y_max)
 
 
 def attach_data(
@@ -86,27 +55,30 @@ def attach_data(
     *,
     tolerance_s: float = TIME_TOLERANCE_SECONDS,
 ) -> tuple[int, int]:
-    """Attach LES / sensor rows to the snapshots they match; drop the rest.
+    """Attach matching rows to each snapshot; return (kept, dropped) counts.
 
-    A row matches a snapshot when its time is within ``tolerance_s`` of the
-    snapshot time and its (x, y) falls inside the snapshot bbox. A row may match
-    more than one snapshot (overlapping windows); it is attached to each.
-
-    Returns ``(kept, dropped)`` row counts for reporting / test assertions.
+    A row may match several snapshots (overlapping windows) and is attached to
+    each.
     """
-
     kept = dropped = 0
     for block in data_blocks:
         if block.size == 0:
             continue
         matched_any = np.zeros(len(block), dtype=bool)
         for snap in snapshots.values():
-            in_time = np.abs(block[:, _T] - snap.time) <= tolerance_s
-            in_space = _within_bbox(block, snap.bbox)
-            keep = in_time & in_space
+            keep = (np.abs(block[:, _T] - snap.time) <= tolerance_s) & _within_bbox(block, snap.bbox)
             if keep.any():
                 snap.blocks.append(block[keep])
                 matched_any |= keep
-        kept += int(matched_any.sum())
-        dropped += int((~matched_any).sum())
+        block_kept = int(matched_any.sum())
+        kept += block_kept
+        dropped += len(block) - block_kept
+        log.debug("block of %d row(s): %d synced, %d dropped",
+                  len(block), block_kept, len(block) - block_kept)
     return kept, dropped
+
+
+def _within_bbox(rows: np.ndarray, bbox: tuple[float, float, float, float]) -> np.ndarray:
+    x_min, x_max, y_min, y_max = bbox
+    x, y = rows[:, _X], rows[:, _Y]
+    return (x >= x_min) & (x <= x_max) & (y >= y_min) & (y <= y_max)
