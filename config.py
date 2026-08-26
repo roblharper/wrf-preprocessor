@@ -100,6 +100,15 @@ REGISTRY: tuple[SourceType, ...] = (
         note="wrfout in lon/lat degrees, m; theta/p' as perturbations",
     ),
     SourceType(
+        name="FastEddy LES", match="FE_NBL", source_code=SRC_SIM,
+        column_map={
+            "x": "x0", "y": "y0", "z": "z4", "t": "time",
+            "u": "uu", "v": "vv", "w": "ww",
+            "theta": "theta", "p_prime": "pressure",   # theta (K), pressure is a perturbation
+        },
+        note="standalone LES; local x/y/z in metres, theta/p' as perturbations",
+    ),
+    SourceType(
         name="ecor sonic wind", match="ecorsfwind", source_code=SRC_SENSOR,
         column_map={
             "x": "lon", "y": "lat", "z": "alt",

@@ -11,29 +11,46 @@ resolved here, once, so the model always sees exactly one format.
 For each HRRR snapshot it writes one `.npy` of rows in a fixed canonical schema:
 
 ```
-x, y, z, t, u, v, w, T, P
+x, y, z, t, u, v, w, theta, p_prime, source
 ```
 
-plus a shared `metadata.json` (schema, the global normalization recipe, and the
-case definition). The PINN's `read_case(name, root)` is then just
-"load `root/<name>.npy`".
+plus a shared `metadata.json` (schema, the global normalization recipe, the
+source-code map, the train/test split, and the case definition). The cases are
+written into `train/` and `test/` subfolders (see below).
 
-> The schema is a **working assumption** pending group agreement. Density is not
-> stored by any source, so the draft carries temperature and pressure (`T`, `P`)
-> and leaves density derivation for later.
+`x, y, z, t` are **required**; a row missing any of them is dropped. The physical
+columns `u, v, w, theta, p_prime` are **optional**: a source that does not
+measure one leaves it `NaN` (the row is kept and the gap is logged). `source` is
+a per-row integer tag identifying the data category the row came from, so the
+model can weight the loss per source.
 
 ## What a "case" is
 
-A case is **one HRRR snapshot** (the inlet the PINN predicts from) bundled with
-the LES and sensor data that belong to it. "Belong to it" means, for each
-snapshot:
+A case is **one HRRR snapshot**. HRRR is the **anchor condition**, not a data
+source: it defines each case's time window and x/y bounding box but contributes
+no rows of its own. The rows in a case come from the LES and sensor data that
+belong to that snapshot. "Belong to it" means:
 
 - **time:** within a tolerance window of the snapshot time
   (`TIME_TOLERANCE_SECONDS`, default ±30 min);
 - **space:** inside the snapshot's x/y bounding box.
 
-Rows matching no snapshot are **dropped**. Normalization is **global**: one
-recipe fit over all synced rows, applied to every case, so they share a scale.
+Rows matching no snapshot are **dropped**, and a snapshot with no matching rows
+is skipped. Normalization is **global**: one recipe fit over all synced rows,
+applied to every case, so they share a scale.
+
+The two data categories in the `source` column are:
+
+| Code | Category | Sources |
+|------|----------|---------|
+| `0` | simulation | LASSO WRF-LES (`wrfout`) |
+| `1` | sensor | ground-observation streams (ecor, smos, twr, ...) |
+
+### Train / test split
+
+Cases are split **by whole case** (seeded, reproducible) into `train/` and
+`test/` subfolders, so the held-out set is genuinely unseen. Controlled by
+`--test-fraction` (default 0.2) and `--seed` (default 0).
 
 ## Pipeline
 
@@ -46,8 +63,8 @@ NetCDF sources ─▶ reader ─▶ (derive) ─▶ sync ─▶ normalize ─▶
 |-------|------|-----|
 | **Reader** | `reader.py` | Stream any NetCDF in chunks (memory-safe); map raw variables to canonical columns by dimension name. |
 | **Processor** | `processor.py` | Run a source's `derive` hook (computed columns), assemble canonical rows, then normalize. |
-| **Sync** | `sync.py` | Split HRRR into per-snapshot bundles; attach LES/sensor rows by time window + bbox; drop the rest. |
-| **Writer** | `writer.py` | One `.npy` per snapshot + shared `metadata.json`. |
+| **Sync** | `sync.py` | Build one snapshot per HRRR time (its time + x/y bbox); attach LES/sensor rows by time window + bbox; drop the rest. |
+| **Writer** | `writer.py` | Split cases into `train/` and `test/`, write each `.npy` + a shared `metadata.json`. |
 | **Orchestrator** | `orchestrator.py` | Thin wiring of the above + CLI. |
 | **Registry** | `config.py` | The canonical schema and the instrument-type records that drive everything. |
 
@@ -76,41 +93,45 @@ SourceType(
 )
 ```
 
-**Direct renames** go in `column_map`. **Computed columns** (a value that is not
-just a rename) go in a small `derive` hook — a pure function of the raw variable
-dict. Existing hooks handle:
+**Direct renames** go in `column_map`. **Computed columns** go in a small
+`derive` hook (a pure function of the raw variable dict). Existing hooks handle
+ARM absolute time (`base_time + time_offset -> t`) and meteorological wind
+(`wspd, wdir -> u, v`).
 
-- ARM absolute time: `base_time + time_offset -> t`
-- meteorological wind: `wspd, wdir -> u, v`
-- temperature: Celsius `-> T` (Kelvin)
-
-Anything a source does not provide is left as `NaN` in the output (a "not
-supplied" marker), so partial sources are fine. A source that carries **no**
-canonical field at all (e.g. instrument housekeeping) is registered with
-`canonical=False`: it is recognized and documented, ready to carry the day the
-schema grows, without being forced into columns that do not fit.
+Any optional column a source omits is left `NaN`, so partial sources are fine
+(only `x, y, z, t` are required). A source with **no** canonical field
+(e.g. housekeeping) is registered with `canonical=False`: recognized, but
+contributes no rows.
 
 Discovery matches files to records by **filename** (ARM datastream naming), so
-files can live in any folder layout and one folder may hold mixed types. Files
-matching no record are reported and skipped, never silently forced.
+layout is free and one folder may hold mixed types. Files matching no record are
+reported and skipped.
 
 ## Usage
 
 ```bash
-# point at a folder tree of NetCDF files; get per-snapshot .npy + metadata
-python orchestrator.py <input_root> <out_dir> [--chunk-size N] [-v | -vv]
+# point at a folder tree of NetCDF files; get split cases + metadata
+python orchestrator.py <input_root> <out_dir> \
+    [--chunk-size N] [--test-fraction F] [--seed S] [-v | -vv]
 ```
 
-`<input_root>` is any folder tree of `.nc` / `.cdf` files (in-flight suffixes
-like `.cdf.v1` are ignored). Logging is silent by default; `-v` shows the sync
-summary and skipped files, `-vv` shows per-block filtering detail. Output:
+`<input_root>` is any folder tree of `.nc` / `.cdf` files. Logging is silent by
+default; `-v` shows the sync summary, `-vv` per-block detail. Output:
 
 ```
 <out_dir>/
-    metadata.json              # schema + global normalization recipe + case def
-    hrrr_t<epoch>.npy          # one per HRRR snapshot
-    ...
+    metadata.json          # schema, normalization recipe, split, case def
+    train/  hrrr_t<epoch>.npy ...
+    test/   hrrr_t<epoch>.npy ...
 ```
+
+### Standalone LES (no HRRR)
+
+To process a single LES case (e.g. FastEddy) without a real HRRR inlet, add a
+**dummy anchor**: a minimal HRRR-named `.nc` with a `valid_time` matching the LES
+time and `longitude`/`latitude` spanning the LES x/y extent. HRRR contributes no
+rows, so the dummy only defines the case window; the LES rows are the data. Use
+`--test-fraction 0` when there is just one case.
 
 ## Testing
 
@@ -119,18 +140,13 @@ pytest        # from this directory
 ```
 
 `fixtures/generate_phony_data.py` writes real-format phony NetCDFs for every
-structural instrument type (gridded snapshot, single-point series, vertical
-profile, speed/direction wind, Celsius temperature, housekeeping), including
-deliberate off-time and off-location rows. `tests/test_end_to_end.py` runs the
-whole pipeline and asserts:
-
-- one `.npy` per snapshot + metadata;
-- every output row is within the time window **and** bbox (junk dropped);
-- the off-location station is excluded; the off-time snapshot has no sync-time data;
-- discovery matches every instrument type by filename;
-- derive hooks produce correct values (absolute time, u/v from speed/dir, K from C);
-- an unmapped (`canonical=False`) type contributes no rows;
-- normalization is global.
+instrument type, including deliberate off-time and off-location rows.
+`tests/test_end_to_end.py` runs the whole pipeline and asserts: cases split into
+`train/`+`test/` with metadata; every output row is inside the time window and
+bbox; off-location/off-time rows are excluded; every type is discovered by
+filename; derive hooks are correct; LASSO supplies `theta`/`p_prime` while
+sensors keep rows with `NaN`; `canonical=False` types contribute no rows;
+normalization is global.
 
 ## Requirements
 
@@ -139,11 +155,11 @@ Python with `numpy` and `netCDF4`. (Runs against the project's `ML_venv`.)
 ## Known limitations / next steps
 
 - **Coordinate reconciliation is not done.** Sources sit in different frames
-  (HRRR/sensor degrees, LES metres, geopotential height vs metres). Cross-source
-  spatial matching currently assumes a shared frame — true on the phony test
-  data, not yet on the real files. Unifying the frames is the next step.
-- **Variable adaptation is partial** (e.g. FastEddy `theta -> T`, deriving
-  density) — the hooks exist; the specific conversions are added as needed.
-- **Normalization** is a placeholder per-column max (the `Normalizer` class);
-  replace its body once the group settles the real scheme.
+  (HRRR/sensor degrees, LES metres); spatial matching assumes a shared frame,
+  true on the phony data but not yet on the real files.
+- **HRRR `theta`/`p'`** are not derived (HRRR stores actual `T`/pressure, not the
+  WRF-style perturbations); left `NaN` pending a group decision on the reference
+  state.
+- **Normalization** is a placeholder per-column max; swap the `Normalizer` body
+  once the real scheme is settled.
 - **Parallel reads** are designed for (chunks are independent) but not built.
