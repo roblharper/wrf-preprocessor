@@ -47,19 +47,23 @@ def _write_hrrr(path: Path, *, valid_time: float, seed: int) -> None:
 
 
 def _write_les(path: Path, *, valid_time: float, seed: int, lon_c: float, lat_c: float) -> None:
+    """LASSO wrfout-shaped LES: XLONG/XLAT/HGT + U/V/W + T(theta)/P(p') on mass grid."""
     rng = np.random.default_rng(seed)
     n = 5; nz = 3
     ds = netCDF4.Dataset(path, "w")
-    ds.createDimension("time", 1); ds.createDimension("z4", nz)
-    ds.createDimension("y0", n); ds.createDimension("x0", n)
-    ds.createVariable("x0", "f8", ("x0",))[:] = np.linspace(lon_c - 0.08, lon_c + 0.08, n)
-    ds.createVariable("y0", "f8", ("y0",))[:] = np.linspace(lat_c - 0.06, lat_c + 0.06, n)
-    ds.createVariable("z4", "f8", ("z4",))[:] = np.linspace(*REGION_Z, nz)
-    ds.createVariable("time", "f8", ("time",))[:] = [valid_time]
+    ds.createDimension("Time", 1); ds.createDimension("bottom_top", nz)
+    ds.createDimension("south_north", n); ds.createDimension("west_east", n)
+    lon = np.linspace(lon_c - 0.08, lon_c + 0.08, n)
+    lat = np.linspace(lat_c - 0.06, lat_c + 0.06, n)
+    lon2d, lat2d = np.meshgrid(lon, lat)
+    ds.createVariable("XLONG", "f4", ("Time", "south_north", "west_east"))[:, :, :] = lon2d
+    ds.createVariable("XLAT", "f4", ("Time", "south_north", "west_east"))[:, :, :] = lat2d
+    ds.createVariable("HGT", "f4", ("Time", "south_north", "west_east"))[:, :, :] = 300.0
+    ds.createVariable("valid_time", "f8", ("Time",))[:] = [valid_time]
     shape = (1, nz, n, n)
-    for name, base in (("uu", 5.0), ("vv", 2.0), ("ww", 0.1),
-                       ("pressure", 95000.0), ("theta", 300.0)):
-        ds.createVariable(name, "f4", ("time", "z4", "y0", "x0"))[:, :, :, :] = \
+    # U,V,W winds; T = perturbation potential temperature (theta); P = pert. pressure (p')
+    for name, base in (("U", 5.0), ("V", 2.0), ("W", 0.1), ("T", 1.5), ("P", 20.0)):
+        ds.createVariable(name, "f4", ("Time", "bottom_top", "south_north", "west_east"))[:, :, :, :] = \
             base + rng.normal(0, 0.1, size=shape)
     ds.close()
 
@@ -166,9 +170,9 @@ def generate(root: Path, *, seed: int = 0) -> dict:
     _write_hrrr(root / "hrrr" / "hrrr_off.nc", valid_time=off_time, seed=seed + 3)
 
     # interior LES: 2 at SYNC_TIME + 1 off-time
-    _write_les(root / "sim" / "les_a.nc", valid_time=SYNC_TIME, seed=seed + 4, lon_c=lon_c, lat_c=lat_c)
-    _write_les(root / "sim" / "les_b.nc", valid_time=SYNC_TIME, seed=seed + 5, lon_c=lon_c, lat_c=lat_c)
-    _write_les(root / "sim" / "les_off.nc", valid_time=off_time, seed=seed + 6, lon_c=lon_c, lat_c=lat_c)
+    _write_les(root / "sim" / "wrfout_a.nc", valid_time=SYNC_TIME, seed=seed + 4, lon_c=lon_c, lat_c=lat_c)
+    _write_les(root / "sim" / "wrfout_b.nc", valid_time=SYNC_TIME, seed=seed + 5, lon_c=lon_c, lat_c=lat_c)
+    _write_les(root / "sim" / "wrfout_off.nc", valid_time=off_time, seed=seed + 6, lon_c=lon_c, lat_c=lat_c)
 
     o = root / "obs"
     # ecor sonic wind: 2 in-region stations (straddle window) + off-time + far

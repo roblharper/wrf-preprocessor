@@ -11,8 +11,18 @@ from typing import Callable
 import numpy as np
 
 
-#: Output columns, in order. The writer emits and the PINN reads exactly this.
-CANONICAL_COLUMNS: tuple[str, ...] = ("x", "y", "z", "t", "u", "v", "w", "T", "P")
+#: Physical columns read from the files, in order.
+PHYSICAL_COLUMNS: tuple[str, ...] = ("x", "y", "z", "t", "u", "v", "w",
+                                     "theta", "p_prime")
+
+#: Columns a row MUST have. A row is dropped only if one of these is NaN (it has
+#: no usable position/time). Everything else (u,v,w,theta,p_prime) may be NaN for
+#: a source that does not measure it; missing optional columns are logged, kept.
+REQUIRED_COLUMNS: tuple[str, ...] = ("x", "y", "z", "t")
+
+#: Full output schema: the physical columns plus a per-row integer source tag
+#: (which SourceType the row came from), so the loss can weight sources.
+CANONICAL_COLUMNS: tuple[str, ...] = PHYSICAL_COLUMNS + ("source",)
 COLUMN_INDEX: dict[str, int] = {name: i for i, name in enumerate(CANONICAL_COLUMNS)}
 
 #: Half-width of the time-match window: rows within +/- this of a snapshot time
@@ -42,12 +52,11 @@ def _smos(raw: Raw) -> Raw:
     return {**_time_from_base_offset(raw), **_uv_from_speed_dir(raw)}
 
 
-def _tower_temp(raw: Raw) -> Raw:
-    """ARM time, plus air temperature Celsius -> Kelvin."""
-    out = _time_from_base_offset(raw)
-    if "temp" in raw:
-        out["T"] = raw["temp"] + 273.15
-    return out
+# Source category codes written to the 'source' column. Grouped by kind (not per
+# instrument) so the loss can weight inlet / simulation / sensor differently.
+SRC_INLET = 0       # HRRR
+SRC_SIM = 1         # LES (LASSO)
+SRC_SENSOR = 2      # all ground-observation streams
 
 
 @dataclass(frozen=True)
@@ -61,6 +70,7 @@ class SourceType:
 
     name: str
     match: str                          # filename substring identifying the type
+    source_code: int = -1               # per-row tag written to the 'source' column
     is_anchor: bool = False             # True only for HRRR (defines the snapshots)
     column_map: dict[str, str] = field(default_factory=dict)
     derive: Callable[[Raw], Raw] | None = None
@@ -75,25 +85,26 @@ _ARM_TIME = ("base_time", "time_offset")
 
 REGISTRY: tuple[SourceType, ...] = (
     SourceType(
-        name="HRRR forecast tile", match="hrrr", is_anchor=True,
+        name="HRRR forecast tile", match="hrrr", source_code=SRC_INLET, is_anchor=True,
         column_map={
             "x": "longitude", "y": "latitude", "z": "geopotential_height",
             "t": "valid_time",
             "u": "u_wind", "v": "v_wind", "w": "vertical_velocity",
-            "T": "temperature", "P": "pressure",
         },
         note="lat/lon degrees on hybrid pressure levels; the inlet condition",
     ),
     SourceType(
-        name="FastEddy / LASSO LES", match="les",
+        name="LASSO WRF-LES", match="wrfout", source_code=SRC_SIM,
         column_map={
-            "x": "x0", "y": "y0", "z": "z4", "t": "time",
-            "u": "uu", "v": "vv", "w": "ww", "P": "pressure",  # theta->T later
+            "x": "XLONG", "y": "XLAT", "z": "HGT", "t": "valid_time",
+            "u": "U", "v": "V", "w": "W",
+            "theta": "T", "p_prime": "P",   # wrfout T = pert. theta, P = pert. pressure
         },
-        note="high-res interior truth; metres frame (reconciliation pending)",
+        chunk_dim="Time",
+        note="wrfout in lon/lat degrees, m; theta/p' as perturbations",
     ),
     SourceType(
-        name="ecor sonic wind", match="ecorsfwind",
+        name="ecor sonic wind", match="ecorsfwind", source_code=SRC_SENSOR,
         column_map={
             "x": "lon", "y": "lat", "z": "alt",
             "u": "wind_u", "v": "wind_v", "w": "wind_w",
@@ -102,24 +113,23 @@ REGISTRY: tuple[SourceType, ...] = (
         note="single-point 3-D sonic wind at ~10 Hz",
     ),
     SourceType(
-        name="soil-met surface wx", match="smos",
+        name="soil-met surface wx", match="smos", source_code=SRC_SENSOR,
         derive=_smos, derive_inputs=_ARM_TIME + ("wspd", "wdir"),
         note="wind as speed/direction; no lat/lon stored",
     ),
     SourceType(
-        name="tower met (T/RH)", match="twr",
+        name="tower met (T/RH)", match="twr", source_code=SRC_SENSOR,
         column_map={"x": "lon", "y": "lat", "z": "alt"},
-        derive=_tower_temp, derive_inputs=_ARM_TIME + ("temp",),
-        note="tower temperature/humidity; no wind",
+        derive=_time_from_base_offset, derive_inputs=_ARM_TIME,
+        note="tower met; no wind components",
     ),
     SourceType(
-        name="flux + met", match="co2flx",
-        column_map={"P": "bar_pres"},
+        name="flux + met", match="co2flx", source_code=SRC_SENSOR,
         derive=_time_from_base_offset, derive_inputs=_ARM_TIME,
         note="mostly fluxes; little canonical state",
     ),
     SourceType(
-        name="best-estimate profiles", match="armbeatm",
+        name="best-estimate profiles", match="armbeatm", source_code=SRC_SENSOR,
         column_map={"u": "u_wind_sfc", "v": "v_wind_sfc"},
         derive=_time_from_base_offset, derive_inputs=_ARM_TIME,
         note="merged vertical profiles; surface wind mapped for now",

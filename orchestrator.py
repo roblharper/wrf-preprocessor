@@ -15,8 +15,11 @@ from writer import write_cases
 log = logging.getLogger(__name__)
 
 
-def run(input_root: Path, out_dir: Path, *, chunk_size: int = 1) -> list[Path]:
-    """Run the full pipeline and return the written snapshot files."""
+def run(
+    input_root: Path, out_dir: Path, *, chunk_size: int = 1,
+    test_fraction: float = 0.2, seed: int = 0,
+) -> dict[str, list[Path]]:
+    """Run the full pipeline; return the written train/ and test/ case files."""
     anchor_blocks: list[np.ndarray] = []
     data_blocks: list[np.ndarray] = []
     for path, source in discover_files(input_root):
@@ -32,7 +35,8 @@ def run(input_root: Path, out_dir: Path, *, chunk_size: int = 1) -> list[Path]:
 
     normalizer = Normalizer.fit(snap.rows() for snap in snapshots.values())
     cases = {cid: normalizer.transform(snap.rows()) for cid, snap in snapshots.items()}
-    return write_cases(out_dir, cases, normalizer.recipe())
+    return write_cases(out_dir, cases, normalizer.recipe(),
+                       test_fraction=test_fraction, seed=seed)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -47,6 +51,10 @@ def main(argv: list[str] | None = None) -> int:
                         help="Output folder for per-snapshot .npy files + metadata.json.")
     parser.add_argument("--chunk-size", type=int, default=1,
                         help="Chunk size along each source's chunk dimension (default 1).")
+    parser.add_argument("--test-fraction", type=float, default=0.2,
+                        help="Fraction of cases held out for testing (default 0.2).")
+    parser.add_argument("--seed", type=int, default=0,
+                        help="Seed for the reproducible train/test split.")
     parser.add_argument("-v", "--verbose", action="count", default=0,
                         help="-v for progress (INFO), -vv for filtering detail (DEBUG).")
     args = parser.parse_args(argv)
@@ -54,10 +62,10 @@ def main(argv: list[str] | None = None) -> int:
     level = [logging.WARNING, logging.INFO, logging.DEBUG][min(args.verbose, 2)]
     logging.basicConfig(level=level, format="%(levelname)s %(name)s: %(message)s")
 
-    written = run(args.input_root, args.out_dir, chunk_size=args.chunk_size)
-    print(f"Wrote {len(written)} snapshot file(s) + metadata.json to {args.out_dir}")
-    for p in written:
-        print(f"  {p.name}")
+    written = run(args.input_root, args.out_dir, chunk_size=args.chunk_size,
+                  test_fraction=args.test_fraction, seed=args.seed)
+    print(f"Wrote {len(written['train'])} train + {len(written['test'])} test "
+          f"case(s) + metadata.json to {args.out_dir}")
     return 0
 
 

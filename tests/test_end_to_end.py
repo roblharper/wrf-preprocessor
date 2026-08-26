@@ -47,17 +47,19 @@ def _raw_snapshots(root: Path):
     return snaps, kept, dropped
 
 
-def test_pipeline_writes_one_npy_per_snapshot(phony, tmp_path):
+def test_pipeline_writes_split_cases(phony, tmp_path):
     root, manifest = phony
     out = tmp_path / "out"
     written = orchestrator.run(root, out, chunk_size=50)
 
-    # two distinct HRRR times -> two snapshots + metadata.json
-    assert len(written) == 2
+    # two snapshots, split into train/ and test/ dirs + a shared metadata.json
+    all_stems = {p.stem for p in written["train"] + written["test"]}
+    assert all_stems == {f"hrrr_t{int(manifest['sync_time'])}",
+                         f"hrrr_t{int(manifest['off_time'])}"}
     assert (out / "metadata.json").exists()
-    stems = {p.stem for p in written}
-    assert stems == {f"hrrr_t{int(manifest['sync_time'])}",
-                     f"hrrr_t{int(manifest['off_time'])}"}
+    assert len(written["test"]) >= 1  # at least one held out
+    # splits are disjoint
+    assert not ({p.stem for p in written["train"]} & {p.stem for p in written["test"]})
 
 
 def test_every_row_is_time_and_space_synced(phony):
@@ -105,11 +107,12 @@ def test_normalization_is_global(phony, tmp_path):
     scale = meta["normalization"]["scale"]
     assert len(scale) == len(COLUMN_INDEX)
 
-    # every written case is normalized by that same scale -> values within [-1, 1]
-    for name in meta["cases"]:
-        d = np.load(out / f"{name}.npy")
+    # physical columns are within [-1, 1]; the source tag is left unscaled.
+    phys = [i for c, i in COLUMN_INDEX.items() if c != "source"]
+    for f in out.rglob("*.npy"):
+        d = np.load(f)[:, phys]
         finite = d[np.isfinite(d)]
-        assert np.all(np.abs(finite) <= 1.0 + 1e-9), f"{name}: values exceed global scale"
+        assert np.all(np.abs(finite) <= 1.0 + 1e-9), f"{f.stem}: values exceed global scale"
 
 
 # --- multi-type registry: discovery, derive hooks, unmapped types ------------
@@ -118,14 +121,13 @@ def test_discovery_matches_multiple_instrument_types(phony):
 
     root, _ = phony
     matched = {src.match for _, src in discover_files(root)}
-    # at least the anchor, interior, and several observation types are present
-    for expected in ("hrrr", "les", "ecorsfwind", "smos", "twr", "co2flx",
+    for expected in ("hrrr", "wrfout", "ecorsfwind", "smos", "twr", "co2flx",
                      "armbeatm", "dlaux"):
         assert expected in matched, f"{expected} not discovered"
 
 
 def test_derive_hooks_produce_correct_canonical_values(phony):
-    """ARM time (base+offset), smos speed/dir -> u,v, and twr Celsius -> Kelvin."""
+    """ARM time (base+offset) and smos speed/direction -> u, v."""
 
     root, _ = phony
     obs = root / "obs"
@@ -140,19 +142,67 @@ def test_derive_hooks_produce_correct_canonical_values(phony):
                 return b
         return None
 
-    # ARM absolute time is epoch-scale, not seconds-since-midnight.
+    # ecor has coordinates, so it survives the NaN-row drop; check absolute time.
     ecor = first_canonical("ecorsfwind_a*")
     assert ecor[0, _T] > 1_000_000_000, "ecor t is not an absolute epoch time"
 
-    # smos: wspd=5, wdir=270 (from the west) -> u ~ +5, v ~ 0.
-    U, V = COLUMN_INDEX["u"], COLUMN_INDEX["v"]
-    smos = first_canonical("smos_a*")
-    assert abs(smos[0, U] - 5.0) < 0.5 and abs(smos[0, V]) < 0.5
+    # smos has no lat/lon (dropped downstream), so test its wind derivation at
+    # the hook level: wspd=5, wdir=270 (from the west) -> u ~ +5, v ~ 0.
+    from config import _uv_from_speed_dir
+    import numpy as np
+    out = _uv_from_speed_dir({"wspd": np.array([5.0]), "wdir": np.array([270.0])})
+    assert abs(out["u"][0] - 5.0) < 0.5 and abs(out["v"][0]) < 0.5
 
-    # twr: 18 C -> ~291 K.
-    Tc = COLUMN_INDEX["T"]
-    twr = first_canonical("twr25m*")
-    assert 288.0 < twr[0, Tc] < 294.0
+
+def test_source_tag_written_per_category(phony, tmp_path):
+    """Each output row carries its source category code (inlet/sim/sensor)."""
+
+    from config import SRC_INLET, SRC_SIM, SRC_SENSOR
+    root, _ = phony
+    out = tmp_path / "out"
+    orchestrator.run(root, out, chunk_size=50)
+
+    src_col = COLUMN_INDEX["source"]
+    all_tags = set()
+    for f in out.rglob("*.npy"):
+        all_tags |= set(np.load(f)[:, src_col].astype(int).tolist())
+    assert all_tags == {SRC_INLET, SRC_SIM, SRC_SENSOR}
+
+
+def test_optional_columns_nan_do_not_drop_rows(phony, tmp_path):
+    """Sources lacking theta/p' keep their rows (NaN); LASSO supplies theta/p'."""
+
+    from config import SRC_SIM, SRC_SENSOR
+    root, _ = phony
+    out = tmp_path / "out"
+    orchestrator.run(root, out, chunk_size=50)
+
+    src = COLUMN_INDEX["source"]
+    th, pp = COLUMN_INDEX["theta"], COLUMN_INDEX["p_prime"]
+    rows = np.vstack([np.load(f) for f in out.rglob("*.npy")])
+
+    sim = rows[rows[:, src] == SRC_SIM]
+    sensor = rows[rows[:, src] == SRC_SENSOR]
+    # LASSO (sim) supplies theta/p'; sensors keep rows but with NaN theta/p'
+    assert sim.size and np.isfinite(sim[:, [th, pp]]).all()
+    assert sensor.size and np.isnan(sensor[:, [th, pp]]).all()
+    # required coords/time are never NaN in any kept row
+    req = [COLUMN_INDEX[c] for c in ("x", "y", "z", "t")]
+    assert np.isfinite(rows[:, req]).all()
+
+
+def test_train_test_split_is_written_and_reproducible(phony, tmp_path):
+    """Cases split into train/ and test/ dirs; the seeded split is stable."""
+
+    root, _ = phony
+    a = orchestrator.run(root, tmp_path / "a", chunk_size=50, seed=0)
+    b = orchestrator.run(root, tmp_path / "b", chunk_size=50, seed=0)
+
+    assert (tmp_path / "a" / "train").is_dir() and (tmp_path / "a" / "test").is_dir()
+    assert a["test"], "expected at least one held-out test case"
+    # same seed -> same partition
+    assert {p.stem for p in a["train"]} == {p.stem for p in b["train"]}
+    assert {p.stem for p in a["test"]} == {p.stem for p in b["test"]}
 
 
 def test_unmapped_type_contributes_no_rows(phony):
