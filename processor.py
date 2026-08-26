@@ -20,6 +20,9 @@ _REQUIRED_IDX = [COLUMN_INDEX[c] for c in REQUIRED_COLUMNS]
 _OPTIONAL = tuple(c for c in PHYSICAL_COLUMNS if c not in REQUIRED_COLUMNS)
 
 
+_ANCHOR_IDX = [COLUMN_INDEX[c] for c in ("t", "x", "y")]
+
+
 def to_canonical(chunk: Chunk, source: SourceType) -> np.ndarray:
     """Run the source's derive hook, stack into canonical order, drop unusable rows.
 
@@ -34,6 +37,18 @@ def to_canonical(chunk: Chunk, source: SourceType) -> np.ndarray:
         chunk = {**chunk, **source.derive(chunk)}
     rows = _assemble(chunk, source.source_code)
     return _drop_unusable_rows(rows, source)
+
+
+def anchor_points(chunk: Chunk, source: SourceType) -> np.ndarray:
+    """(t, x, y) triples from an anchor (HRRR); it defines snapshots, not data.
+
+    The anchor only supplies each snapshot's time and x/y extent, so it needs no
+    z or physical fields and never becomes a row in the .npy.
+    """
+    if not chunk:
+        return np.empty((0, 3), dtype=np.float64)
+    rows = _assemble(chunk, source.source_code)[:, _ANCHOR_IDX]
+    return rows[np.isfinite(rows).all(axis=1)]
 
 
 def _drop_unusable_rows(rows: np.ndarray, source: SourceType) -> np.ndarray:

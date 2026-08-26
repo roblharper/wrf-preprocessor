@@ -7,7 +7,7 @@ from pathlib import Path
 
 import numpy as np
 
-from config import CANONICAL_COLUMNS, TIME_TOLERANCE_SECONDS, SRC_INLET, SRC_SIM, SRC_SENSOR
+from config import CANONICAL_COLUMNS, TIME_TOLERANCE_SECONDS, SRC_SIM, SRC_SENSOR
 
 
 def write_cases(
@@ -69,8 +69,7 @@ def _write_metadata(
             "dtype": "float64",
             "layout": "rows x columns, columns in schema order",
             "missing_value": "NaN (column not supplied by source)",
-            "source_codes": {SRC_INLET: "inlet", SRC_SIM: "simulation",
-                             SRC_SENSOR: "sensor"},
+            "source_codes": {SRC_SIM: "simulation", SRC_SENSOR: "sensor"},
         },
         "case_definition": {
             "unit": "one HRRR snapshot plus co-located, co-temporal LES/sensor rows",

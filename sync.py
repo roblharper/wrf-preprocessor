@@ -20,9 +20,17 @@ _X = COLUMN_INDEX["x"]
 _Y = COLUMN_INDEX["y"]
 
 
+#: anchor_points columns: (t, x, y)
+_A_T, _A_X, _A_Y = 0, 1, 2
+
+
 @dataclass
 class Snapshot:
-    """One HRRR snapshot and the data synced to it."""
+    """One HRRR snapshot condition (time + bbox) and the data synced to it.
+
+    HRRR itself contributes no rows; ``blocks`` holds only the LES/sensor rows
+    attached to this snapshot.
+    """
 
     time: float
     bbox: tuple[float, float, float, float]  # x_min, x_max, y_min, y_max
@@ -33,19 +41,23 @@ class Snapshot:
 
 
 def build_snapshots(anchor_blocks: list[np.ndarray]) -> dict[str, Snapshot]:
-    """One snapshot per distinct HRRR time; bbox = that time's x/y extent."""
+    """One snapshot per distinct HRRR time; bbox = that time's x/y extent.
+
+    ``anchor_blocks`` are (t, x, y) triples from the anchor (HRRR). Each snapshot
+    is seeded empty: HRRR defines the case condition, it is not data.
+    """
     if not anchor_blocks:
         raise RuntimeError("No anchor (HRRR) rows found; a case needs an HRRR snapshot.")
     hrrr = np.vstack(anchor_blocks)
 
     snapshots: dict[str, Snapshot] = {}
-    for t in np.unique(hrrr[:, _T]):
-        rows = hrrr[hrrr[:, _T] == t]
+    for t in np.unique(hrrr[:, _A_T]):
+        pts = hrrr[hrrr[:, _A_T] == t]
         bbox = (
-            float(np.nanmin(rows[:, _X])), float(np.nanmax(rows[:, _X])),
-            float(np.nanmin(rows[:, _Y])), float(np.nanmax(rows[:, _Y])),
+            float(np.nanmin(pts[:, _A_X])), float(np.nanmax(pts[:, _A_X])),
+            float(np.nanmin(pts[:, _A_Y])), float(np.nanmax(pts[:, _A_Y])),
         )
-        snapshots[f"hrrr_t{int(round(t))}"] = Snapshot(float(t), bbox, [rows])
+        snapshots[f"hrrr_t{int(round(t))}"] = Snapshot(float(t), bbox)
     return snapshots
 
 

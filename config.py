@@ -52,11 +52,11 @@ def _smos(raw: Raw) -> Raw:
     return {**_time_from_base_offset(raw), **_uv_from_speed_dir(raw)}
 
 
-# Source category codes written to the 'source' column. Grouped by kind (not per
-# instrument) so the loss can weight inlet / simulation / sensor differently.
-SRC_INLET = 0       # HRRR
-SRC_SIM = 1         # LES (LASSO)
-SRC_SENSOR = 2      # all ground-observation streams
+# Source category codes written to the 'source' column, so the loss can weight
+# simulation vs sensor. HRRR is NOT a data source: each .npy IS an HRRR snapshot
+# condition, so HRRR only anchors the case (time + bbox) and contributes no rows.
+SRC_SIM = 0         # LES (LASSO)
+SRC_SENSOR = 1      # all ground-observation streams
 
 
 @dataclass(frozen=True)
@@ -85,13 +85,9 @@ _ARM_TIME = ("base_time", "time_offset")
 
 REGISTRY: tuple[SourceType, ...] = (
     SourceType(
-        name="HRRR forecast tile", match="hrrr", source_code=SRC_INLET, is_anchor=True,
-        column_map={
-            "x": "longitude", "y": "latitude", "z": "geopotential_height",
-            "t": "valid_time",
-            "u": "u_wind", "v": "v_wind", "w": "vertical_velocity",
-        },
-        note="lat/lon degrees on hybrid pressure levels; the inlet condition",
+        name="HRRR forecast tile", match="hrrr", is_anchor=True,
+        column_map={"x": "longitude", "y": "latitude", "t": "valid_time"},
+        note="anchor only: defines each snapshot's time + x/y bbox, not a data source",
     ),
     SourceType(
         name="LASSO WRF-LES", match="wrfout", source_code=SRC_SIM,

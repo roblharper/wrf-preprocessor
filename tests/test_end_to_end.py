@@ -16,7 +16,7 @@ sys.path.insert(0, str(_PKG / "fixtures"))
 
 from config import COLUMN_INDEX, TIME_TOLERANCE_SECONDS
 from reader import discover_files, read_file
-from processor import to_canonical
+from processor import to_canonical, anchor_points
 from sync import build_snapshots, attach_data
 import orchestrator
 import generate_phony_data as gen
@@ -39,9 +39,14 @@ def _raw_snapshots(root: Path):
     anchor, data = [], []
     for path, src in discover_files(root):
         for ch in read_file(path, src, chunk_size=50):
-            b = to_canonical(ch, src)
-            if b.size:
-                (anchor if src.is_anchor else data).append(b)
+            if src.is_anchor:
+                pts = anchor_points(ch, src)
+                if pts.size:
+                    anchor.append(pts)
+            else:
+                b = to_canonical(ch, src)
+                if b.size:
+                    data.append(b)
     snaps = build_snapshots(anchor)
     kept, dropped = attach_data(snaps, data)
     return snaps, kept, dropped
@@ -155,9 +160,12 @@ def test_derive_hooks_produce_correct_canonical_values(phony):
 
 
 def test_source_tag_written_per_category(phony, tmp_path):
-    """Each output row carries its source category code (inlet/sim/sensor)."""
+    """Each output row carries its source category code (sim/sensor).
 
-    from config import SRC_INLET, SRC_SIM, SRC_SENSOR
+    HRRR is the anchor condition, not a data source, so no inlet rows appear.
+    """
+
+    from config import SRC_SIM, SRC_SENSOR
     root, _ = phony
     out = tmp_path / "out"
     orchestrator.run(root, out, chunk_size=50)
@@ -166,7 +174,7 @@ def test_source_tag_written_per_category(phony, tmp_path):
     all_tags = set()
     for f in out.rglob("*.npy"):
         all_tags |= set(np.load(f)[:, src_col].astype(int).tolist())
-    assert all_tags == {SRC_INLET, SRC_SIM, SRC_SENSOR}
+    assert all_tags == {SRC_SIM, SRC_SENSOR}
 
 
 def test_optional_columns_nan_do_not_drop_rows(phony, tmp_path):

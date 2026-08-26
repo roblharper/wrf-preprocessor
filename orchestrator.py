@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 
 from reader import discover_files, read_file
-from processor import to_canonical, Normalizer
+from processor import to_canonical, anchor_points, Normalizer
 from sync import build_snapshots, attach_data
 from writer import write_cases
 
@@ -23,18 +23,26 @@ def run(
     anchor_blocks: list[np.ndarray] = []
     data_blocks: list[np.ndarray] = []
     for path, source in discover_files(input_root):
-        target = anchor_blocks if source.is_anchor else data_blocks
         for chunk in read_file(path, source, chunk_size=chunk_size):
-            block = to_canonical(chunk, source)
-            if block.size:
-                target.append(block)
+            # HRRR anchors the case (time + bbox); everything else is data.
+            if source.is_anchor:
+                pts = anchor_points(chunk, source)
+                if pts.size:
+                    anchor_blocks.append(pts)
+            else:
+                block = to_canonical(chunk, source)
+                if block.size:
+                    data_blocks.append(block)
 
     snapshots = build_snapshots(anchor_blocks)
     kept, dropped = attach_data(snapshots, data_blocks)
-    log.info("%d snapshot(s); synced %d row(s), dropped %d", len(snapshots), kept, dropped)
+    # A snapshot with no synced rows carries no data; skip it.
+    cases_with_data = {cid: s for cid, s in snapshots.items() if s.blocks}
+    log.info("%d snapshot(s), %d with data; synced %d row(s), dropped %d",
+             len(snapshots), len(cases_with_data), kept, dropped)
 
-    normalizer = Normalizer.fit(snap.rows() for snap in snapshots.values())
-    cases = {cid: normalizer.transform(snap.rows()) for cid, snap in snapshots.items()}
+    normalizer = Normalizer.fit(s.rows() for s in cases_with_data.values())
+    cases = {cid: normalizer.transform(s.rows()) for cid, s in cases_with_data.items()}
     return write_cases(out_dir, cases, normalizer.recipe(),
                        test_fraction=test_fraction, seed=seed)
 
