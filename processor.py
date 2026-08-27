@@ -89,39 +89,83 @@ def _assemble(chunk: Chunk, source_code: int) -> np.ndarray:
     return np.column_stack(columns)
 
 
-class Normalizer:
-    """Per-column scaling by max absolute value (keeps columns in [-1, 1]).
+#: name -> function taking the stacked finite-column stats (min, max) and
+#: returning per-column (offset, scale) for ``normalized = (value - offset) / scale``.
+NORMALIZERS = {}
 
-    A placeholder scheme; replace the body here to adopt the real one.
+
+def _register(name):
+    def deco(fn):
+        NORMALIZERS[name] = fn
+        return fn
+    return deco
+
+
+@_register("minmax_pm1")
+def _minmax_pm1(col_min: np.ndarray, col_max: np.ndarray):
+    """Map each column's [min, max] to [-1, 1]: offset = midpoint, scale = half-range."""
+    offset = (col_max + col_min) / 2.0
+    scale = (col_max - col_min) / 2.0
+    return offset, scale
+
+
+@_register("abs_max")
+def _abs_max(col_min: np.ndarray, col_max: np.ndarray):
+    """Scale-only by max absolute value (legacy): offset 0, keeps sign, in [-1, 1]."""
+    offset = np.zeros_like(col_min)
+    scale = np.maximum(np.abs(col_min), np.abs(col_max))
+    return offset, scale
+
+
+class Normalizer:
+    """Global affine normalization: ``normalized = (value - offset) / scale``.
+
+    The inverse ``value = offset + scale * normalized`` matches the codebase's
+    scaling convention. The scheme is swappable via ``method`` (see NORMALIZERS);
+    ``minmax_pm1`` (default) maps each column to [-1, 1].
     """
 
-    def __init__(self, scale: np.ndarray) -> None:
+    def __init__(self, offset: np.ndarray, scale: np.ndarray, method: str) -> None:
+        self._offset = offset
         self._scale = scale
+        self._method = method
 
     @classmethod
-    def fit(cls, blocks: Iterable[np.ndarray]) -> "Normalizer":
+    def fit(cls, blocks: Iterable[np.ndarray], *, method: str = "minmax_pm1") -> "Normalizer":
         """Fit globally over all synced rows (one recipe for every case).
 
         A column that is entirely NaN (e.g. theta/p' when no source supplied it)
-        gets scale 1.0 and is left untouched, so its NaNs pass through unchanged.
+        gets offset 0 / scale 1 and is left untouched, so its NaNs pass through.
         """
+        if method not in NORMALIZERS:
+            raise ValueError(f"Unknown normalization method '{method}'; "
+                             f"choose from {sorted(NORMALIZERS)}.")
         consolidated = [b for b in blocks if b.size]
         if not consolidated:
             raise RuntimeError("No rows to fit the normalizer on after syncing.")
+        stacked = np.vstack(consolidated)
         with warnings.catch_warnings():   # all-NaN columns are expected (optional cols)
             warnings.simplefilter("ignore", RuntimeWarning)
-            scale = np.nanmax(np.abs(np.vstack(consolidated)), axis=0)
-        scale = np.where(np.isfinite(scale) & (scale != 0.0), scale, 1.0)
-        scale[COLUMN_INDEX["source"]] = 1.0   # categorical tag: never scaled
-        return cls(scale)
+            col_min = np.nanmin(stacked, axis=0)
+            col_max = np.nanmax(stacked, axis=0)
+
+        offset, scale = NORMALIZERS[method](col_min, col_max)
+        # degenerate columns (all-NaN, or constant) become the identity map
+        bad = ~(np.isfinite(offset) & np.isfinite(scale) & (scale != 0.0))
+        offset = np.where(bad, 0.0, offset)
+        scale = np.where(bad, 1.0, scale)
+        s = COLUMN_INDEX["source"]
+        offset[s], scale[s] = 0.0, 1.0   # categorical tag: never scaled
+        return cls(offset, scale, method)
 
     def transform(self, data: np.ndarray) -> np.ndarray:
-        return data / self._scale
+        return (data - self._offset) / self._scale
 
     def recipe(self) -> dict:
         return {
-            "method": "per_column_abs_max",
+            "method": self._method,
             "columns": list(CANONICAL_COLUMNS),
+            "offset": self._offset.tolist(),
             "scale": self._scale.tolist(),
-            "formula": "normalized = value / scale",
+            "formula": "value = offset + scale * normalized",
         }

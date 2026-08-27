@@ -108,16 +108,18 @@ def test_normalization_is_global(phony, tmp_path):
     orchestrator.run(root, out, chunk_size=50)
 
     meta = json.loads((out / "metadata.json").read_text())
-    # one global recipe with a scale per canonical column
-    scale = meta["normalization"]["scale"]
-    assert len(scale) == len(COLUMN_INDEX)
+    # one global affine recipe: offset + scale per canonical column
+    norm = meta["normalization"]
+    offset, scale = norm["offset"], norm["scale"]
+    assert len(scale) == len(COLUMN_INDEX) and len(offset) == len(COLUMN_INDEX)
+    assert norm["method"] == "minmax_pm1"
 
     # physical columns are within [-1, 1]; the source tag is left unscaled.
     phys = [i for c, i in COLUMN_INDEX.items() if c != "source"]
     for f in out.rglob("*.npy"):
         d = np.load(f)[:, phys]
         finite = d[np.isfinite(d)]
-        assert np.all(np.abs(finite) <= 1.0 + 1e-9), f"{f.stem}: values exceed global scale"
+        assert np.all(np.abs(finite) <= 1.0 + 1e-9), f"{f.stem}: values exceed [-1, 1]"
 
 
 # --- multi-type registry: discovery, derive hooks, unmapped types ------------

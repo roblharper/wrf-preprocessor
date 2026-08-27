@@ -1,10 +1,9 @@
 # WRF-PINN pre-processor
 
 Consolidates heterogeneous atmospheric NetCDF data into **one normalized binary
-per HRRR snapshot** that the PINN reads directly. It lives *outside* the model
-codebase on purpose: the PINN should never become a data reader. All the messy
-differences between sources (variables, units, coordinates, resolutions) are
-resolved here, once, so the model always sees exactly one format.
+per HRRR snapshot**, ready to load directly. All the differences between sources
+(variables, units, coordinates, resolutions) are resolved here, once, so a
+consumer sees exactly one format.
 
 ## What it produces
 
@@ -21,8 +20,8 @@ written into `train/` and `test/` subfolders (see below).
 `x, y, z, t` are **required**; a row missing any of them is dropped. The physical
 columns `u, v, w, theta, p_prime` are **optional**: a source that does not
 measure one leaves it `NaN` (the row is kept and the gap is logged). `source` is
-a per-row integer tag identifying the data category the row came from, so the
-model can weight the loss per source.
+a per-row integer tag identifying the data category the row came from, so a
+consumer can weight it per source.
 
 ## What a "case" is
 
@@ -36,8 +35,10 @@ belong to that snapshot. "Belong to it" means:
 - **space:** inside the snapshot's x/y bounding box.
 
 Rows matching no snapshot are **dropped**, and a snapshot with no matching rows
-is skipped. Normalization is **global**: one recipe fit over all synced rows,
-applied to every case, so they share a scale.
+is skipped. Normalization is **global** and **affine**: one recipe
+(`value = offset + scale * normalized`) fit over all synced rows and applied to
+every case, so they share a scale. The scheme is swappable (see `NORMALIZERS` in
+`processor.py`); the default maps each column to `[-1, 1]`.
 
 The two data categories in the `source` column are:
 
@@ -150,7 +151,7 @@ normalization is global.
 
 ## Requirements
 
-Python with `numpy` and `netCDF4`. (Runs against the project's `ML_venv`.)
+Python with `numpy` and `netCDF4`.
 
 ## Known limitations / next steps
 
@@ -158,8 +159,8 @@ Python with `numpy` and `netCDF4`. (Runs against the project's `ML_venv`.)
   (HRRR/sensor degrees, LES metres); spatial matching assumes a shared frame,
   true on the phony data but not yet on the real files.
 - **HRRR `theta`/`p'`** are not derived (HRRR stores actual `T`/pressure, not the
-  WRF-style perturbations); left `NaN` pending a group decision on the reference
+  WRF-style perturbations); left `NaN`, since deriving them needs a reference
   state.
-- **Normalization** is a placeholder per-column max; swap the `Normalizer` body
-  once the real scheme is settled.
+- **Normalization** defaults to affine min-max into `[-1, 1]`; add or select
+  another scheme in `NORMALIZERS` (`processor.py`).
 - **Parallel reads** are designed for (chunks are independent) but not built.
