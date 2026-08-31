@@ -22,6 +22,7 @@ def run(
     """Run the full pipeline; return the written train/ and test/ case files."""
     anchor_blocks: list[np.ndarray] = []
     data_blocks: list[np.ndarray] = []
+    normalization_bounds: dict[str, tuple[float, float]] = {}
     for path, source in discover_files(input_root):
         for chunk in read_file(path, source, chunk_size=chunk_size):
             # HRRR anchors the case (time + bbox); everything else is data.
@@ -34,6 +35,14 @@ def run(
                 if block.size:
                     data_blocks.append(block)
 
+        for column, bounds in source.normalization_bounds.items():
+            existing = normalization_bounds.get(column)
+            if existing is not None and existing != bounds:
+                raise ValueError(f"Conflicting normalization bounds for {column}:"
+                    f" {existing} versus {bounds}")
+            
+            normalization_bounds[column] = bounds
+
     snapshots = build_snapshots(anchor_blocks)
     kept, dropped = attach_data(snapshots, data_blocks)
     # A snapshot with no synced rows carries no data; skip it.
@@ -42,7 +51,7 @@ def run(
              len(snapshots), len(cases_with_data), kept, dropped)
 
     normalizer = Normalizer.fit( (s.rows() for s in cases_with_data.values()),
-                                method="minmax_01")
+                                method="minmax_01", bounds=normalization_bounds)
     cases = {cid: normalizer.transform(s.rows()) for cid, s in cases_with_data.items()}
     return write_cases(out_dir, cases, normalizer.recipe(),
                        test_fraction=test_fraction, seed=seed)

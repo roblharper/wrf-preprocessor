@@ -137,7 +137,8 @@ class Normalizer:
         self._method = method
 
     @classmethod
-    def fit(cls, blocks: Iterable[np.ndarray], *, method: str = "minmax_pm1") -> "Normalizer":
+    def fit(cls, blocks: Iterable[np.ndarray], *, method: str = "minmax_pm1",
+            bounds: dict[str, tuple[float, float]] | None = None,) -> "Normalizer":
         """Fit globally over all synced rows (one recipe for every case).
 
         A column that is entirely NaN (e.g. theta/p' when no source supplied it)
@@ -154,6 +155,18 @@ class Normalizer:
             warnings.simplefilter("ignore", RuntimeWarning)
             col_min = np.nanmin(stacked, axis=0)
             col_max = np.nanmax(stacked, axis=0)
+
+        if bounds:
+            for column, (lower, upper) in bounds.items():
+                if column not in COLUMN_INDEX:
+                    raise ValueError(f"Unknown normalization column: {column}")
+                if upper <= lower:
+                    raise ValueError(f"Invalid normalization bounds for {column}:"
+                        f" {lower}, {upper}")
+
+                index = COLUMN_INDEX[column]
+                col_min[index] = lower
+                col_max[index] = upper
 
         offset, scale = NORMALIZERS[method](col_min, col_max)
         # degenerate columns (all-NaN, or constant) become the identity map

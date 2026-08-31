@@ -88,6 +88,8 @@ class SourceType:
     derive_inputs: tuple[str, ...] = ()
     chunk_dim: str = "time"
     canonical: bool = True
+    # to match the domain simulation box instead of center-cell grid. default is empty & unused
+    normalization_bounds: dict[str, tuple[float, float]] = field(default_factory=dict)  
     note: str = ""
 
 
@@ -121,6 +123,7 @@ REGISTRY: tuple[SourceType, ...] = (
         # forecast_reference_time is unix format time when simulation/measurement has started
         derive_inputs=("forecast_reference_time",), # 1 element tuple
         derive=_fasteddy_relative_time,
+        normalization_bounds={"x": (0.0, 9345.0), "y": (0.0, 9345.0), "z": (0.0, 1100.0)},
         note="standalone LES; local x/y/z in metres, theta/p' as perturbations",
     ),
     SourceType(
