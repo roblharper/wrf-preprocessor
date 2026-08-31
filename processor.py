@@ -108,6 +108,12 @@ def _minmax_pm1(col_min: np.ndarray, col_max: np.ndarray):
     scale = (col_max - col_min) / 2.0
     return offset, scale
 
+@_register("minmax_01")
+def _minmax_01(col_min: np.ndarray, col_max: np.ndarray):
+    """Map each column's [min, max] to [0, 1]."""
+    offset = col_min
+    scale = col_max - col_min
+    return offset, scale
 
 @_register("abs_max")
 def _abs_max(col_min: np.ndarray, col_max: np.ndarray):

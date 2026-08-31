@@ -41,7 +41,8 @@ def run(
     log.info("%d snapshot(s), %d with data; synced %d row(s), dropped %d",
              len(snapshots), len(cases_with_data), kept, dropped)
 
-    normalizer = Normalizer.fit(s.rows() for s in cases_with_data.values())
+    normalizer = Normalizer.fit( (s.rows() for s in cases_with_data.values()),
+                                method="minmax_01")
     cases = {cid: normalizer.transform(s.rows()) for cid, s in cases_with_data.items()}
     return write_cases(out_dir, cases, normalizer.recipe(),
                        test_fraction=test_fraction, seed=seed)

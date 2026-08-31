@@ -27,7 +27,7 @@ COLUMN_INDEX: dict[str, int] = {name: i for i, name in enumerate(CANONICAL_COLUM
 
 #: Half-width of the time-match window: rows within +/- this of a snapshot time
 #: are synced to it. Sensors are high-rate, so an exact match is too strict.
-TIME_TOLERANCE_SECONDS = 1800.0   # +/- 30 min (half of hourly HRRR cadence)
+TIME_TOLERANCE_SECONDS = 4350.0   # +/- 30 min (half of hourly HRRR cadence)
 
 # --- derive hooks: compute canonical columns that are not plain renames -------
 Raw = dict[str, np.ndarray]
@@ -47,6 +47,17 @@ def _uv_from_speed_dir(raw: Raw) -> Raw:
         return {"u": -raw["wspd"] * np.sin(theta), "v": -raw["wspd"] * np.cos(theta)}
     return {}
 
+def _fasteddy_relative_time(raw: Raw) -> Raw:
+    """Convert FastEddy Unix time to seconds since forecast start time."""
+    if "t" not in raw or "forecast_reference_time" not in raw:
+        return {}
+
+    t = raw["t"]
+    reference = raw["forecast_reference_time"]
+
+    # Most files store Unix seconds, but some already store relative seconds.
+    is_unix = t > 5_000_000
+    return {"t": np.where(is_unix, t - reference, t)}
 
 def _smos(raw: Raw) -> Raw:
     return {**_time_from_base_offset(raw), **_uv_from_speed_dir(raw)}
@@ -106,6 +117,10 @@ REGISTRY: tuple[SourceType, ...] = (
             "u": "uu", "v": "vv", "w": "ww",
             "theta": "theta", "p_prime": "pressure",   # theta (K), pressure is a perturbation
         },
+        # read forecast_reference_time variable
+        # forecast_reference_time is unix format time when simulation/measurement has started
+        derive_inputs=("forecast_reference_time",), # 1 element tuple
+        derive=_fasteddy_relative_time,
         note="standalone LES; local x/y/z in metres, theta/p' as perturbations",
     ),
     SourceType(

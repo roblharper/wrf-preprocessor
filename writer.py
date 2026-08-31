@@ -40,7 +40,11 @@ def write_cases(
 def _split_ids(ids: list[str], test_fraction: float, seed: int) -> tuple[list[str], list[str]]:
     """Shuffle case ids by seed and split off ``test_fraction`` for testing."""
     order = np.random.default_rng(seed).permutation(len(ids))
-    n_test = max(1, round(len(ids) * test_fraction)) if ids else 0
+    # don't generate test data if test_fraction = 0
+    if test_fraction <= 0:
+        n_test = 0
+    else:
+        n_test = max(1, round(len(ids) * test_fraction))
     test = {ids[i] for i in order[:n_test]}
     return [i for i in ids if i not in test], [i for i in ids if i in test]
 
