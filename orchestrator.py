@@ -25,12 +25,14 @@ log = logging.getLogger(__name__)
 
 def run(
     input_root: Path, out_dir: Path, *, chunk_size: int = 1,
-    test_fraction: float = 0.2, seed: int = 0, progress=None,
+    test_fraction: float = 0.2, seed: int = 0, progress=None, spill_dir=None,
 ) -> dict[str, list[Path]]:
     """Run the full pipeline; return the written train/ and test/ case files.
 
     ``progress(phase, done, total)`` is called (if given) as files are read and
-    cases are written, so long runs are not a silent terminal.
+    cases are written, so long runs are not a silent terminal. ``spill_dir`` sets
+    where pass-1 row spills go (default: system temp); point it at scratch on HPC,
+    /tmp on a compute node is often tiny or RAM-backed.
     """
     def _tick(phase, done, total):
         if progress is not None:
@@ -46,13 +48,14 @@ def run(
     ]
     snapshots = build_snapshots(anchor_blocks)
 
-    with tempfile.TemporaryDirectory(prefix="preproc_spill_") as spill_dir:
+    with tempfile.TemporaryDirectory(prefix="preproc_spill_", dir=spill_dir) as spill:
         stats = RunningMinMax(len(CANONICAL_COLUMNS))
-        spills = _SpillSet(Path(spill_dir), snapshots)
+        spills = _SpillSet(Path(spill), snapshots)
 
         # pass 1: read data files once, route rows to per-snapshot spills + stats.
         kept = dropped = 0
         data_files = [(p, s) for p, s in files if not s.is_anchor]
+        _tick("read", 0, len(data_files))   # show the phase started before file 1
         for i, (path, src) in enumerate(data_files, 1):
             for chunk in read_file(path, src, chunk_size=chunk_size):
                 block = to_canonical(chunk, src)
