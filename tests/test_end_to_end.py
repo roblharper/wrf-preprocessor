@@ -225,3 +225,23 @@ def test_unmapped_type_contributes_no_rows(phony):
     assert src is not None and src.canonical is False
     rows = [to_canonical(ch, src) for ch in read_file(p, src, chunk_size=50)]
     assert all(b.shape[0] == 0 for b in rows), "unmapped type produced rows"
+
+
+def test_staggered_winds_collapse_to_mass_grid(phony):
+    """Real wrfout has staggered U/V/W; destaggering must not blow up the grid.
+
+    Regression for the 81 TiB outer-product bug: every column must flatten to the
+    same mass-grid row count, and Times must parse to an absolute epoch.
+    """
+
+    from config import match_source
+    root, _ = phony
+    p = next((root / "sim").glob("wrfout_a*"))
+    src = match_source(p.name)
+    chunk = next(read_file(p, src, chunk_size=50))
+
+    lengths = {len(v) for v in chunk.values()}
+    assert len(lengths) == 1, f"columns disagree on row count: {lengths}"
+    for name in ("u", "v", "w", "theta", "p_prime"):
+        assert name in chunk, f"{name} missing after destagger"
+    assert float(chunk["t"][0]) > 1_000_000_000, "Times not parsed to epoch"

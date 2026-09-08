@@ -92,12 +92,12 @@ REGISTRY: tuple[SourceType, ...] = (
     SourceType(
         name="LASSO WRF-LES", match="wrfout", source_code=SRC_SIM,
         column_map={
-            "x": "XLONG", "y": "XLAT", "z": "HGT", "t": "valid_time",
+            "x": "XLONG", "y": "XLAT", "z": "HGT", "t": "Times",
             "u": "U", "v": "V", "w": "W",
             "theta": "T", "p_prime": "P",   # wrfout T = pert. theta, P = pert. pressure
         },
         chunk_dim="Time",
-        note="wrfout in lon/lat degrees, m; theta/p' as perturbations",
+        note="wrfout: WRF Times char array (parsed to epoch s), winds destaggered",
     ),
     SourceType(
         name="FastEddy LES", match="FE_NBL", source_code=SRC_SIM,

@@ -46,25 +46,40 @@ def _write_hrrr(path: Path, *, valid_time: float, seed: int) -> None:
     ds.close()
 
 
+def _wrf_times(valid_time: float) -> np.ndarray:
+    """WRF Times char array (1, 19) for one epoch: 'YYYY-MM-DD_HH:MM:SS'."""
+    from datetime import datetime, timezone
+
+    stamp = datetime.fromtimestamp(valid_time, tz=timezone.utc).strftime("%Y-%m-%d_%H:%M:%S")
+    return np.array([list(stamp)], dtype="S1")
+
+
 def _write_les(path: Path, *, valid_time: float, seed: int, lon_c: float, lat_c: float) -> None:
-    """LASSO wrfout-shaped LES: XLONG/XLAT/HGT + U/V/W + T(theta)/P(p') on mass grid."""
+    """Real LASSO wrfout shape: Times char stamp + Arakawa-C staggered U/V/W."""
     rng = np.random.default_rng(seed)
     n = 5; nz = 3
     ds = netCDF4.Dataset(path, "w")
-    ds.createDimension("Time", 1); ds.createDimension("bottom_top", nz)
-    ds.createDimension("south_north", n); ds.createDimension("west_east", n)
+    ds.createDimension("Time", 1); ds.createDimension("DateStrLen", 19)
+    ds.createDimension("bottom_top", nz); ds.createDimension("bottom_top_stag", nz + 1)
+    ds.createDimension("south_north", n); ds.createDimension("south_north_stag", n + 1)
+    ds.createDimension("west_east", n); ds.createDimension("west_east_stag", n + 1)
     lon = np.linspace(lon_c - 0.08, lon_c + 0.08, n)
     lat = np.linspace(lat_c - 0.06, lat_c + 0.06, n)
     lon2d, lat2d = np.meshgrid(lon, lat)
     ds.createVariable("XLONG", "f4", ("Time", "south_north", "west_east"))[:, :, :] = lon2d
     ds.createVariable("XLAT", "f4", ("Time", "south_north", "west_east"))[:, :, :] = lat2d
     ds.createVariable("HGT", "f4", ("Time", "south_north", "west_east"))[:, :, :] = 300.0
-    ds.createVariable("valid_time", "f8", ("Time",))[:] = [valid_time]
-    shape = (1, nz, n, n)
-    # U,V,W winds; T = perturbation potential temperature (theta); P = pert. pressure (p')
-    for name, base in (("U", 5.0), ("V", 2.0), ("W", 0.1), ("T", 1.5), ("P", 20.0)):
-        ds.createVariable(name, "f4", ("Time", "bottom_top", "south_north", "west_east"))[:, :, :, :] = \
-            base + rng.normal(0, 0.1, size=shape)
+    ds.createVariable("Times", "S1", ("Time", "DateStrLen"))[:, :] = _wrf_times(valid_time)
+    # winds on staggered (cell-face) grids; T/P scalars on the mass grid
+    for name, base, dims in (
+        ("U", 5.0, ("Time", "bottom_top", "south_north", "west_east_stag")),
+        ("V", 2.0, ("Time", "bottom_top", "south_north_stag", "west_east")),
+        ("W", 0.1, ("Time", "bottom_top_stag", "south_north", "west_east")),
+        ("T", 1.5, ("Time", "bottom_top", "south_north", "west_east")),
+        ("P", 20.0, ("Time", "bottom_top", "south_north", "west_east")),
+    ):
+        shape = tuple(len(ds.dimensions[d]) for d in dims)
+        ds.createVariable(name, "f4", dims)[:] = base + rng.normal(0, 0.1, size=shape)
     ds.close()
 
 

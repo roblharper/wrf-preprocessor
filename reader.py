@@ -67,8 +67,51 @@ def _read_block(ds: "netCDF4.Dataset", source: SourceType, start: int, stop: int
     sliced: dict[str, tuple[np.ndarray, tuple[str, ...]]] = {}
     for out_key, varname in wanted:
         if varname in ds.variables:
-            sliced[out_key] = _slice_along(ds.variables[varname], source.chunk_dim, start, stop)
+            arr, dims = _slice_along(ds.variables[varname], source.chunk_dim, start, stop)
+            if arr.dtype.kind == "S":                       # WRF Times char array
+                arr, dims = _parse_time_strings(arr, dims, source.chunk_dim)
+            sliced[out_key] = _destagger(arr, dims)
     return _broadcast_to_rows(sliced)
+
+
+def _parse_time_strings(
+    arr: np.ndarray, dims: tuple[str, ...], chunk_dim: str
+) -> tuple[np.ndarray, tuple[str, ...]]:
+    """Decode a WRF ``Times`` char array (N, 19) to epoch seconds, shape (N,)."""
+    from datetime import datetime, timezone
+
+    rows = arr.reshape(arr.shape[0], -1)                    # (N, DateStrLen)
+    epochs = np.empty(rows.shape[0], dtype=np.float64)
+    for i, row in enumerate(rows):
+        stamp = b"".join(np.asarray(row).ravel()).decode().replace("_", " ")
+        dt = datetime.strptime(stamp, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        epochs[i] = dt.timestamp()
+    return epochs, (chunk_dim,)
+
+
+#: WRF Arakawa-C staggered dims -> the mass-grid dim they interpolate onto.
+_STAGGER_MAP = {
+    "west_east_stag": "west_east",
+    "south_north_stag": "south_north",
+    "bottom_top_stag": "bottom_top",
+}
+
+
+def _destagger(arr: np.ndarray, dims: tuple[str, ...]) -> tuple[np.ndarray, tuple[str, ...]]:
+    """Average staggered (cell-face) axes onto the mass grid so dim names align.
+
+    WRF winds live on faces (e.g. U on ``west_east_stag`` = N+1), scalars on
+    centres (``west_east`` = N). Without this the reader broadcasts the two as
+    different axes and the row grid explodes to their outer product.
+    """
+    out_dims = list(dims)
+    for i, d in enumerate(dims):
+        if d in _STAGGER_MAP:
+            lo = np.take(arr, range(0, arr.shape[i] - 1), axis=i)
+            hi = np.take(arr, range(1, arr.shape[i]), axis=i)
+            arr = 0.5 * (lo + hi)
+            out_dims[i] = _STAGGER_MAP[d]
+    return arr, tuple(out_dims)
 
 
 def _slice_along(
