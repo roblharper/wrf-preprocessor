@@ -61,27 +61,46 @@ def build_snapshots(anchor_blocks: list[np.ndarray]) -> dict[str, Snapshot]:
     return snapshots
 
 
+def match_snapshots(
+    block: np.ndarray,
+    snapshots: dict[str, Snapshot],
+    *,
+    tolerance_s: float = TIME_TOLERANCE_SECONDS,
+) -> tuple[dict[str, np.ndarray], np.ndarray]:
+    """Split one block into per-snapshot matching rows, without holding state.
+
+    Returns ``({cid: rows}, matched_mask)``. A row may match several snapshots
+    (overlapping windows) and appears in each. Used by the streaming pipeline so
+    rows are spilled per case instead of accumulated in memory.
+    """
+    matched_any = np.zeros(len(block), dtype=bool)
+    per_case: dict[str, np.ndarray] = {}
+    for cid, snap in snapshots.items():
+        keep = (np.abs(block[:, _T] - snap.time) <= tolerance_s) & _within_bbox(block, snap.bbox)
+        if keep.any():
+            per_case[cid] = block[keep]
+            matched_any |= keep
+    return per_case, matched_any
+
+
 def attach_data(
     snapshots: dict[str, Snapshot],
     data_blocks: list[np.ndarray],
     *,
     tolerance_s: float = TIME_TOLERANCE_SECONDS,
 ) -> tuple[int, int]:
-    """Attach matching rows to each snapshot; return (kept, dropped) counts.
+    """Attach matching rows to each snapshot in memory; return (kept, dropped).
 
-    A row may match several snapshots (overlapping windows) and is attached to
-    each.
+    In-memory path kept for tests/small runs; the pipeline streams via
+    ``match_snapshots`` instead. A row may match several snapshots.
     """
     kept = dropped = 0
     for block in data_blocks:
         if block.size == 0:
             continue
-        matched_any = np.zeros(len(block), dtype=bool)
-        for snap in snapshots.values():
-            keep = (np.abs(block[:, _T] - snap.time) <= tolerance_s) & _within_bbox(block, snap.bbox)
-            if keep.any():
-                snap.blocks.append(block[keep])
-                matched_any |= keep
+        per_case, matched_any = match_snapshots(block, snapshots, tolerance_s=tolerance_s)
+        for cid, rows in per_case.items():
+            snapshots[cid].blocks.append(rows)
         block_kept = int(matched_any.sum())
         kept += block_kept
         dropped += len(block) - block_kept

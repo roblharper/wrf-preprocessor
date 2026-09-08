@@ -10,6 +10,43 @@ import numpy as np
 from config import CANONICAL_COLUMNS, TIME_TOLERANCE_SECONDS, SRC_SIM, SRC_SENSOR
 
 
+class CaseWriter:
+    """Stream cases straight into train/ or test/ (no staging copy).
+
+    The train/test split is decided up front from the known case ids, so each
+    normalized case is written once to its final home. Peak RAM = one case,
+    peak extra disk = one case.
+    """
+
+    def __init__(self, out_dir: Path, normalization_recipe: dict, case_ids, *,
+                 test_fraction: float = 0.2, seed: int = 0) -> None:
+        self._out = out_dir
+        self._recipe = normalization_recipe
+        self._test_fraction = test_fraction
+        self._seed = seed
+        train_ids, test_ids = _split_ids(sorted(case_ids), test_fraction, seed)
+        self._group = {cid: "train" for cid in train_ids}
+        self._group.update({cid: "test" for cid in test_ids})
+        for name in ("train", "test"):
+            (out_dir / name).mkdir(parents=True, exist_ok=True)
+        self._counts: dict[str, int] = {}
+        self._written: dict[str, list[Path]] = {"train": [], "test": []}
+
+    def add(self, case_id: str, data: np.ndarray) -> None:
+        if not data.size:
+            return
+        group = self._group[case_id]
+        path = self._out / group / f"{case_id}.npy"
+        np.save(path, data)
+        self._counts[case_id] = int(data.shape[0])
+        self._written[group].append(path)
+
+    def finalize(self) -> dict[str, list[Path]]:
+        _write_metadata(self._out, self._recipe, self._counts, self._written,
+                        self._test_fraction, self._seed)
+        return self._written
+
+
 def write_cases(
     out_dir: Path,
     cases: dict[str, np.ndarray],
@@ -25,16 +62,12 @@ def write_cases(
     shared metadata.json.
     """
 
-    non_empty = sorted(cid for cid, data in cases.items() if data.size)
-    train_ids, test_ids = _split_ids(non_empty, test_fraction, seed)
-
-    out_dir.mkdir(parents=True, exist_ok=True)
-    written = {
-        "train": _write_group(out_dir / "train", train_ids, cases),
-        "test": _write_group(out_dir / "test", test_ids, cases),
-    }
-    _write_metadata(out_dir, normalization_recipe, cases, written, test_fraction, seed)
-    return written
+    ids = [cid for cid, data in cases.items() if data.size]
+    writer = CaseWriter(out_dir, normalization_recipe, ids,
+                        test_fraction=test_fraction, seed=seed)
+    for cid, data in cases.items():
+        writer.add(cid, data)
+    return writer.finalize()
 
 
 def _split_ids(ids: list[str], test_fraction: float, seed: int) -> tuple[list[str], list[str]]:
@@ -45,20 +78,10 @@ def _split_ids(ids: list[str], test_fraction: float, seed: int) -> tuple[list[st
     return [i for i in ids if i not in test], [i for i in ids if i in test]
 
 
-def _write_group(group_dir: Path, ids: list[str], cases: dict[str, np.ndarray]) -> list[Path]:
-    group_dir.mkdir(parents=True, exist_ok=True)
-    paths = []
-    for case_id in ids:
-        path = group_dir / f"{case_id}.npy"
-        np.save(path, cases[case_id])
-        paths.append(path)
-    return paths
-
-
 def _write_metadata(
     out_dir: Path,
     normalization_recipe: dict,
-    cases: dict[str, np.ndarray],
+    counts: dict[str, int],
     written: dict[str, list[Path]],
     test_fraction: float,
     seed: int,
@@ -80,7 +103,7 @@ def _write_metadata(
         "split": {"test_fraction": test_fraction, "seed": seed},
         "normalization": normalization_recipe,
         "cases": {
-            group: {p.stem: int(cases[p.stem].shape[0]) for p in paths}
+            group: {p.stem: counts[p.stem] for p in paths}
             for group, paths in written.items()
         },
     }

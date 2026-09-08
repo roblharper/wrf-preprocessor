@@ -117,6 +117,29 @@ def _abs_max(col_min: np.ndarray, col_max: np.ndarray):
     return offset, scale
 
 
+class RunningMinMax:
+    """Streaming per-column NaN-aware min/max, so global stats need no full stack.
+
+    Feed row blocks one at a time; peak memory is one block, not the whole set.
+    """
+
+    def __init__(self, n_cols: int) -> None:
+        self._min = np.full(n_cols, np.inf)
+        self._max = np.full(n_cols, -np.inf)
+
+    def update(self, block: np.ndarray) -> None:
+        if block.size == 0:
+            return
+        with warnings.catch_warnings():   # all-NaN columns are expected (optional cols)
+            warnings.simplefilter("ignore", RuntimeWarning)
+            self._min = np.fmin(self._min, np.nanmin(block, axis=0))
+            self._max = np.fmax(self._max, np.nanmax(block, axis=0))
+
+    def result(self) -> tuple[np.ndarray, np.ndarray]:
+        seen = np.isfinite(self._min) & np.isfinite(self._max)
+        return np.where(seen, self._min, np.nan), np.where(seen, self._max, np.nan)
+
+
 class Normalizer:
     """Global affine normalization: ``normalized = (value - offset) / scale``.
 
@@ -131,24 +154,12 @@ class Normalizer:
         self._method = method
 
     @classmethod
-    def fit(cls, blocks: Iterable[np.ndarray], *, method: str = "minmax_pm1") -> "Normalizer":
-        """Fit globally over all synced rows (one recipe for every case).
-
-        A column that is entirely NaN (e.g. theta/p' when no source supplied it)
-        gets offset 0 / scale 1 and is left untouched, so its NaNs pass through.
-        """
+    def from_stats(cls, col_min: np.ndarray, col_max: np.ndarray, *,
+                   method: str = "minmax_pm1") -> "Normalizer":
+        """Build from precomputed global min/max (see RunningMinMax)."""
         if method not in NORMALIZERS:
             raise ValueError(f"Unknown normalization method '{method}'; "
                              f"choose from {sorted(NORMALIZERS)}.")
-        consolidated = [b for b in blocks if b.size]
-        if not consolidated:
-            raise RuntimeError("No rows to fit the normalizer on after syncing.")
-        stacked = np.vstack(consolidated)
-        with warnings.catch_warnings():   # all-NaN columns are expected (optional cols)
-            warnings.simplefilter("ignore", RuntimeWarning)
-            col_min = np.nanmin(stacked, axis=0)
-            col_max = np.nanmax(stacked, axis=0)
-
         offset, scale = NORMALIZERS[method](col_min, col_max)
         # degenerate columns (all-NaN, or constant) become the identity map
         bad = ~(np.isfinite(offset) & np.isfinite(scale) & (scale != 0.0))
@@ -157,6 +168,24 @@ class Normalizer:
         s = COLUMN_INDEX["source"]
         offset[s], scale[s] = 0.0, 1.0   # categorical tag: never scaled
         return cls(offset, scale, method)
+
+    @classmethod
+    def fit(cls, blocks: Iterable[np.ndarray], *, method: str = "minmax_pm1") -> "Normalizer":
+        """Fit globally over all synced rows, streaming (one recipe for every case).
+
+        A column that is entirely NaN (e.g. theta/p' when no source supplied it)
+        gets offset 0 / scale 1 and is left untouched, so its NaNs pass through.
+        """
+        stats = RunningMinMax(len(CANONICAL_COLUMNS))
+        seen_any = False
+        for b in blocks:
+            if b.size:
+                stats.update(b)
+                seen_any = True
+        if not seen_any:
+            raise RuntimeError("No rows to fit the normalizer on after syncing.")
+        col_min, col_max = stats.result()
+        return cls.from_stats(col_min, col_max, method=method)
 
     def transform(self, data: np.ndarray) -> np.ndarray:
         return (data - self._offset) / self._scale

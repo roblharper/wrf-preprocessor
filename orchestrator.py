@@ -1,50 +1,115 @@
-"""Wire the pipeline: reader -> to_canonical -> sync -> normalize -> writer."""
+"""Wire the pipeline: reader -> to_canonical -> sync -> normalize -> writer.
+
+Streams so peak memory is one case, not the whole dataset:
+  pass 1  read every file once, spill each snapshot's rows to a temp .npy,
+          accumulating global min/max on the fly (RunningMinMax)
+  pass 2  reload one spill at a time, normalize, write the final case, free it
+"""
 
 from __future__ import annotations
 
 import logging
+import tempfile
 from pathlib import Path
 
 import numpy as np
 
+from config import CANONICAL_COLUMNS
 from reader import discover_files, read_file
-from processor import to_canonical, anchor_points, Normalizer
-from sync import build_snapshots, attach_data
-from writer import write_cases
+from processor import to_canonical, anchor_points, Normalizer, RunningMinMax
+from sync import build_snapshots, match_snapshots
+from writer import CaseWriter
 
 log = logging.getLogger(__name__)
 
 
 def run(
     input_root: Path, out_dir: Path, *, chunk_size: int = 1,
-    test_fraction: float = 0.2, seed: int = 0,
+    test_fraction: float = 0.2, seed: int = 0, progress=None,
 ) -> dict[str, list[Path]]:
-    """Run the full pipeline; return the written train/ and test/ case files."""
-    anchor_blocks: list[np.ndarray] = []
-    data_blocks: list[np.ndarray] = []
-    for path, source in discover_files(input_root):
-        for chunk in read_file(path, source, chunk_size=chunk_size):
-            # HRRR anchors the case (time + bbox); everything else is data.
-            if source.is_anchor:
-                pts = anchor_points(chunk, source)
-                if pts.size:
-                    anchor_blocks.append(pts)
-            else:
-                block = to_canonical(chunk, source)
-                if block.size:
-                    data_blocks.append(block)
+    """Run the full pipeline; return the written train/ and test/ case files.
 
+    ``progress(phase, done, total)`` is called (if given) as files are read and
+    cases are written, so long runs are not a silent terminal.
+    """
+    def _tick(phase, done, total):
+        if progress is not None:
+            progress(phase, done, total)
+
+    files = discover_files(input_root)
+
+    # anchors are tiny (t,x,y triples); read them all to define the snapshots.
+    anchor_blocks = [
+        pts for path, src in files if src.is_anchor
+        for chunk in read_file(path, src, chunk_size=chunk_size)
+        for pts in (anchor_points(chunk, src),) if pts.size
+    ]
     snapshots = build_snapshots(anchor_blocks)
-    kept, dropped = attach_data(snapshots, data_blocks)
-    # A snapshot with no synced rows carries no data; skip it.
-    cases_with_data = {cid: s for cid, s in snapshots.items() if s.blocks}
-    log.info("%d snapshot(s), %d with data; synced %d row(s), dropped %d",
-             len(snapshots), len(cases_with_data), kept, dropped)
 
-    normalizer = Normalizer.fit(s.rows() for s in cases_with_data.values())
-    cases = {cid: normalizer.transform(s.rows()) for cid, s in cases_with_data.items()}
-    return write_cases(out_dir, cases, normalizer.recipe(),
-                       test_fraction=test_fraction, seed=seed)
+    with tempfile.TemporaryDirectory(prefix="preproc_spill_") as spill_dir:
+        stats = RunningMinMax(len(CANONICAL_COLUMNS))
+        spills = _SpillSet(Path(spill_dir), snapshots)
+
+        # pass 1: read data files once, route rows to per-snapshot spills + stats.
+        kept = dropped = 0
+        data_files = [(p, s) for p, s in files if not s.is_anchor]
+        for i, (path, src) in enumerate(data_files, 1):
+            for chunk in read_file(path, src, chunk_size=chunk_size):
+                block = to_canonical(chunk, src)
+                if not block.size:
+                    continue
+                k, d = spills.route(block, snapshots, stats)
+                kept += k; dropped += d
+            _tick("read", i, len(data_files))
+
+        log.info("%d snapshot(s), %d with data; synced %d row(s), dropped %d",
+                 len(snapshots), spills.n_nonempty, kept, dropped)
+        normalizer = Normalizer.from_stats(*stats.result())
+
+        # pass 2: reload one case at a time, normalize, write, free.
+        ids = spills.nonempty_ids()
+        writer = CaseWriter(out_dir, normalizer.recipe(), ids,
+                            test_fraction=test_fraction, seed=seed)
+        for i, cid in enumerate(ids, 1):
+            rows = spills.load(cid)
+            writer.add(cid, normalizer.transform(rows))
+            spills.discard(cid)   # free the spill immediately, cap peak disk
+            del rows
+            _tick("write", i, len(ids))
+        return writer.finalize()
+
+
+class _SpillSet:
+    """Per-snapshot append-only row spills on disk, one file per case id."""
+
+    def __init__(self, root: Path, snapshots) -> None:
+        self._root = root
+        self._counts = {cid: 0 for cid in snapshots}
+
+    def route(self, block: np.ndarray, snapshots, stats: RunningMinMax) -> tuple[int, int]:
+        """Append each snapshot's matching rows to its spill; update global stats."""
+        kept, matched = match_snapshots(block, snapshots)  # {cid: rows}, bool mask
+        for cid, rows in kept.items():
+            stats.update(rows)
+            with open(self._root / f"{cid}.npy.part", "ab") as fh:
+                fh.write(np.ascontiguousarray(rows).tobytes())
+            self._counts[cid] += len(rows)
+        n_kept = int(matched.sum())
+        return n_kept, len(block) - n_kept
+
+    @property
+    def n_nonempty(self) -> int:
+        return sum(1 for n in self._counts.values() if n)
+
+    def nonempty_ids(self):
+        return [cid for cid, n in self._counts.items() if n]
+
+    def load(self, cid: str) -> np.ndarray:
+        raw = np.fromfile(self._root / f"{cid}.npy.part", dtype=np.float64)
+        return raw.reshape(-1, len(CANONICAL_COLUMNS))
+
+    def discard(self, cid: str) -> None:
+        (self._root / f"{cid}.npy.part").unlink(missing_ok=True)
 
 
 def main(argv: list[str] | None = None) -> int:
