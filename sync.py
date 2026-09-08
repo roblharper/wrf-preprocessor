@@ -61,22 +61,50 @@ def build_snapshots(anchor_blocks: list[np.ndarray]) -> dict[str, Snapshot]:
     return snapshots
 
 
+class SnapshotIndex:
+    """Snapshots indexed by time so a block only checks those in its time window.
+
+    Testing every block against all snapshots is O(blocks x snapshots) over the
+    full row count, which dominates at scale (e.g. 744 cases x 4.7M rows). Each
+    block spans one narrow time range, so a sorted-time bisection limits the
+    check to the handful of snapshots within +/- tolerance.
+    """
+
+    def __init__(self, snapshots: dict[str, Snapshot], *,
+                 tolerance_s: float = TIME_TOLERANCE_SECONDS) -> None:
+        self._tol = tolerance_s
+        items = sorted(snapshots.items(), key=lambda kv: kv[1].time)
+        self._ids = [cid for cid, _ in items]
+        self._snaps = [s for _, s in items]
+        self._times = np.array([s.time for s in self._snaps], dtype=np.float64)
+
+    def candidates(self, t_lo: float, t_hi: float):
+        """Snapshots whose time could match rows in [t_lo, t_hi] within tolerance."""
+        import bisect
+        lo = bisect.bisect_left(self._times, t_lo - self._tol)
+        hi = bisect.bisect_right(self._times, t_hi + self._tol)
+        return zip(self._ids[lo:hi], self._snaps[lo:hi])
+
+
 def match_snapshots(
     block: np.ndarray,
-    snapshots: dict[str, Snapshot],
+    snapshots,
     *,
     tolerance_s: float = TIME_TOLERANCE_SECONDS,
 ) -> tuple[dict[str, np.ndarray], np.ndarray]:
     """Split one block into per-snapshot matching rows, without holding state.
 
-    Returns ``({cid: rows}, matched_mask)``. A row may match several snapshots
-    (overlapping windows) and appears in each. Used by the streaming pipeline so
-    rows are spilled per case instead of accumulated in memory.
+    ``snapshots`` may be a dict or a ``SnapshotIndex``. Returns
+    ``({cid: rows}, matched_mask)``; a row may match several snapshots and appears
+    in each. Only snapshots within the block's time window are tested.
     """
+    index = snapshots if isinstance(snapshots, SnapshotIndex) \
+        else SnapshotIndex(snapshots, tolerance_s=tolerance_s)
+    t = block[:, _T]
     matched_any = np.zeros(len(block), dtype=bool)
     per_case: dict[str, np.ndarray] = {}
-    for cid, snap in snapshots.items():
-        keep = (np.abs(block[:, _T] - snap.time) <= tolerance_s) & _within_bbox(block, snap.bbox)
+    for cid, snap in index.candidates(float(t.min()), float(t.max())):
+        keep = (np.abs(t - snap.time) <= tolerance_s) & _within_bbox(block, snap.bbox)
         if keep.any():
             per_case[cid] = block[keep]
             matched_any |= keep

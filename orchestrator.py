@@ -17,7 +17,7 @@ import numpy as np
 from config import CANONICAL_COLUMNS
 from reader import discover_files, read_file
 from processor import to_canonical, anchor_points, Normalizer, RunningMinMax
-from sync import build_snapshots, match_snapshots
+from sync import build_snapshots, match_snapshots, SnapshotIndex
 from writer import CaseWriter
 
 log = logging.getLogger(__name__)
@@ -51,6 +51,7 @@ def run(
     with tempfile.TemporaryDirectory(prefix="preproc_spill_", dir=spill_dir) as spill:
         stats = RunningMinMax(len(CANONICAL_COLUMNS))
         spills = _SpillSet(Path(spill), snapshots)
+        index = SnapshotIndex(snapshots)   # time-indexed; built once, not per chunk
 
         # pass 1: read data files once, route rows to per-snapshot spills + stats.
         kept = dropped = 0
@@ -61,7 +62,7 @@ def run(
                 block = to_canonical(chunk, src)
                 if not block.size:
                     continue
-                k, d = spills.route(block, snapshots, stats)
+                k, d = spills.route(block, index, stats)
                 kept += k; dropped += d
             _tick("read", i, len(data_files))
 
