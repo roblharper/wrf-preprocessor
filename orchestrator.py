@@ -68,7 +68,7 @@ def run(
 
         log.info("%d snapshot(s), %d with data; synced %d row(s), dropped %d",
                  len(snapshots), spills.n_nonempty, kept, dropped)
-        normalizer = Normalizer.from_stats(*stats.result())
+        normalizer = Normalizer.from_stats(*stats.result(), method="minmax_01")
 
         # pass 2: reload one case at a time, normalize, write, free.
         ids = spills.nonempty_ids()
