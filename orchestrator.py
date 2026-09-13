@@ -27,44 +27,48 @@ log = logging.getLogger(__name__)
 def run(
     input_root: Path, out_dir: Path, *, chunk_size: int = 1,
     test_fraction: float = 0.2, seed: int = 0, progress=None, spill_dir=None,
-    time_tolerance_s: float = TIME_TOLERANCE_SECONDS, device: str = "cpu",
+    time_tolerance_s: float = TIME_TOLERANCE_SECONDS,
+    device: str = "cpu", batch_size: int = 32,
 ) -> dict[str, list[Path]]:
     """Run the full pipeline; return the written train/ and test/ case files.
 
-    ``device`` runs the per-block math on 'cpu' (numpy) or a GPU ('cuda'); I/O
-    (NetCDF read, .npy write) stays on the CPU. ``progress(phase, done, total)``
-    reports read/write progress; ``spill_dir`` sets where pass-1 spills go.
+    CPU ('cpu') streams one case at a time to disk (bounded RAM). A GPU device
+    ('cuda') runs the block math there and holds ``batch_size`` cases resident,
+    so the user caps peak device memory. I/O (read, write) stays on the CPU.
     """
     def _tick(phase, done, total):
         if progress is not None:
             progress(phase, done, total)
 
     files = discover_files(input_root)
-
-    # anchors are tiny (t,x,y triples); read them all to define the snapshots.
     anchor_blocks = [
         pts for path, src in files if src.is_anchor
         for chunk in read_file(path, src, chunk_size=chunk_size)
         for pts in (anchor_points(chunk, src),) if pts.size
     ]
     snapshots = build_snapshots(anchor_blocks)
+    index = SnapshotIndex(snapshots, tolerance_s=time_tolerance_s)
+    data_files = [(p, s) for p, s in files if not s.is_anchor]
+
+    if device != "cpu":
+        return _run_resident_batched(
+            data_files, snapshots, index, out_dir, chunk_size=chunk_size,
+            test_fraction=test_fraction, seed=seed, tick=_tick,
+            time_tolerance_s=time_tolerance_s, device=device, batch_size=batch_size)
 
     with tempfile.TemporaryDirectory(prefix="preproc_spill_", dir=spill_dir) as spill:
         stats = RunningMinMax(len(CANONICAL_COLUMNS))
         spills = _SpillSet(Path(spill), snapshots)
-        index = SnapshotIndex(snapshots, tolerance_s=time_tolerance_s)
 
         # pass 1: read data files once, route rows to per-snapshot spills + stats.
         kept = dropped = 0
-        data_files = [(p, s) for p, s in files if not s.is_anchor]
-        _tick("read", 0, len(data_files))   # show the phase started before file 1
-        xp = array_module(device)
+        _tick("read", 0, len(data_files))
         for i, (path, src) in enumerate(data_files, 1):
-            for chunk in read_file(path, src, chunk_size=chunk_size, device=device):
-                block = to_canonical(chunk, src, device)
+            for chunk in read_file(path, src, chunk_size=chunk_size):
+                block = to_canonical(chunk, src)
                 if block.shape[0] == 0:
                     continue
-                k, d = spills.route(block, index, stats, xp=xp)
+                k, d = spills.route(block, index, stats)
                 kept += k; dropped += d
             _tick("read", i, len(data_files))
 
@@ -80,10 +84,71 @@ def run(
         for i, cid in enumerate(ids, 1):
             rows = spills.load(cid)
             writer.add(cid, normalizer.transform(rows))
-            spills.discard(cid)   # free the spill immediately, cap peak disk
+            spills.discard(cid)
             del rows
             _tick("write", i, len(ids))
         return writer.finalize()
+
+
+def _canonical_matched(files, index, device, chunk_size, tolerance_s):
+    """Yield (cid, device_rows) for every matched case across ``files``. One file
+    is one snapshot here (one case), so no cross-file concatenation is needed."""
+    xp = array_module(device)
+    for path, src in files:
+        for chunk in read_file(path, src, chunk_size=chunk_size, device=device):
+            block = to_canonical(chunk, src, device)
+            if block.shape[0] == 0:
+                continue
+            kept, _ = match_snapshots(block, index, tolerance_s=tolerance_s, xp=xp)
+            for cid, rows in kept.items():
+                yield cid, rows
+
+
+def _run_resident_batched(data_files, snapshots, index, out_dir, *, chunk_size,
+                          test_fraction, seed, tick, time_tolerance_s, device,
+                          batch_size):
+    """GPU path: process ``batch_size`` cases resident at a time so peak device
+    memory is one batch (user-capped). Two passes over the files: global stats,
+    then normalize + write. No disk spill."""
+    batches = [data_files[i:i + batch_size] for i in range(0, len(data_files), batch_size)]
+
+    # pass 1: global min/max + case ids, one batch resident at a time then freed.
+    stats = RunningMinMax(len(CANONICAL_COLUMNS))
+    ids: list[str] = []
+    tick("read", 0, len(data_files))
+    done = 0
+    for batch in batches:
+        for cid, rows in _canonical_matched(batch, index, device, chunk_size, time_tolerance_s):
+            stats.update(to_numpy(rows))
+            if cid not in ids:
+                ids.append(cid)
+        done += len(batch)
+        tick("read", done, len(data_files))
+    normalizer = Normalizer.from_stats(*stats.result(), method="minmax_01")
+
+    writer = CaseWriter(out_dir, normalizer.recipe(), ids,
+                        test_fraction=test_fraction, seed=seed,
+                        time_tolerance_s=time_tolerance_s)
+
+    # pass 2: one batch resident at a time -> normalize -> write -> free.
+    written = 0
+    for batch in batches:
+        cases: dict[str, list] = {}
+        for cid, rows in _canonical_matched(batch, index, device, chunk_size, time_tolerance_s):
+            cases.setdefault(cid, []).append(rows)
+        for cid, parts in cases.items():
+            rows = parts[0] if len(parts) == 1 else _cat(parts, device)
+            writer.add(cid, normalizer.transform(to_numpy(rows)))
+            written += 1
+            tick("write", written, len(ids))
+        cases.clear()   # free this batch before the next
+    return writer.finalize()
+
+
+def _cat(parts, device):
+    """Concatenate a case's row tensors (torch on GPU, numpy on CPU)."""
+    xp = array_module(device)
+    return xp.cat(parts) if hasattr(xp, "cat") else xp.concatenate(parts)
 
 
 class _SpillSet:
