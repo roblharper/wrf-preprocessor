@@ -33,34 +33,31 @@ TIME_TOLERANCE_SECONDS = 4350.0   # +/- 30 min (half of hourly HRRR cadence)
 Raw = dict[str, np.ndarray]
 
 
-def _time_from_base_offset(raw: Raw) -> Raw:
+def _time_from_base_offset(raw: Raw, xp=np) -> Raw:
     """ARM absolute time = base_time (epoch) + time_offset (s)."""
     if "base_time" in raw and "time_offset" in raw:
         return {"t": raw["base_time"] + raw["time_offset"]}
     return {}
 
 
-def _uv_from_speed_dir(raw: Raw) -> Raw:
+def _uv_from_speed_dir(raw: Raw, xp=np) -> Raw:
     """Wind speed + direction-from (deg) -> eastward u, northward v."""
     if "wspd" in raw and "wdir" in raw:
-        theta = np.deg2rad(raw["wdir"])
-        return {"u": -raw["wspd"] * np.sin(theta), "v": -raw["wspd"] * np.cos(theta)}
+        theta = xp.deg2rad(raw["wdir"])
+        return {"u": -raw["wspd"] * xp.sin(theta), "v": -raw["wspd"] * xp.cos(theta)}
     return {}
 
-def _fasteddy_relative_time(raw: Raw) -> Raw:
+def _fasteddy_relative_time(raw: Raw, xp=np) -> Raw:
     """Convert FastEddy Unix time to seconds since forecast start time."""
     if "t" not in raw or "forecast_reference_time" not in raw:
         return {}
-
     t = raw["t"]
     reference = raw["forecast_reference_time"]
+    is_unix = t > 5_000_000   # some files already store relative seconds
+    return {"t": xp.where(is_unix, t - reference, t)}
 
-    # Most files store Unix seconds, but some already store relative seconds.
-    is_unix = t > 5_000_000
-    return {"t": np.where(is_unix, t - reference, t)}
-
-def _smos(raw: Raw) -> Raw:
-    return {**_time_from_base_offset(raw), **_uv_from_speed_dir(raw)}
+def _smos(raw: Raw, xp=np) -> Raw:
+    return {**_time_from_base_offset(raw, xp), **_uv_from_speed_dir(raw, xp)}
 
 
 # Source category codes written to the 'source' column, so the loss can weight

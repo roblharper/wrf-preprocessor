@@ -12,6 +12,7 @@ from config import (
     CANONICAL_COLUMNS, COLUMN_INDEX, PHYSICAL_COLUMNS, REQUIRED_COLUMNS, SourceType,
 )
 from reader import Chunk
+from device import array_module, make_empty
 
 log = logging.getLogger(__name__)
 
@@ -23,20 +24,17 @@ _OPTIONAL = tuple(c for c in PHYSICAL_COLUMNS if c not in REQUIRED_COLUMNS)
 _ANCHOR_IDX = [COLUMN_INDEX[c] for c in ("t", "x", "y")]
 
 
-def to_canonical(chunk: Chunk, source: SourceType) -> np.ndarray:
+def to_canonical(chunk: Chunk, source: SourceType, device: str = "cpu") -> np.ndarray:
     """Run the source's derive hook, stack into canonical order, drop unusable rows.
-
-    A row is dropped only if a REQUIRED column (x,y,z,t) is NaN. Optional columns
-    (u,v,w,theta,p_prime) may be NaN for a source that does not measure them; the
-    missing ones are logged, not dropped. A ``canonical=False`` source contributes
-    no rows.
-    """
+    Rows are dropped only if a required column (x,y,z,t) is NaN. ``device`` selects
+    numpy (cpu) or torch (gpu) for the array math."""
+    xp = array_module(device)
     if not source.canonical or not chunk:
-        return np.empty((0, len(CANONICAL_COLUMNS)), dtype=np.float64)
+        return make_empty(device)((0, len(CANONICAL_COLUMNS)))
     if source.derive is not None:
-        chunk = {**chunk, **source.derive(chunk)}
-    rows = _assemble(chunk, source.source_code)
-    return _drop_unusable_rows(rows, source)
+        chunk = {**chunk, **source.derive(chunk, xp)}
+    rows = _assemble(chunk, source.source_code, make_empty(device))
+    return _drop_unusable_rows(rows, source, xp)
 
 
 def anchor_points(chunk: Chunk, source: SourceType) -> np.ndarray:
@@ -51,42 +49,46 @@ def anchor_points(chunk: Chunk, source: SourceType) -> np.ndarray:
     return rows[np.isfinite(rows).all(axis=1)]
 
 
-def _drop_unusable_rows(rows: np.ndarray, source: SourceType) -> np.ndarray:
-    """Drop rows missing a required column; log optional columns the source lacks."""
-    if rows.size == 0:
+def _drop_unusable_rows(rows: np.ndarray, source: SourceType, xp=np) -> np.ndarray:
+    """Drop rows with any required column non-finite. ``xp`` is numpy (CPU) or
+    torch (GPU); the ops used are common to both."""
+    if rows.shape[0] == 0:
         return rows
 
-    missing = [c for c in _OPTIONAL if np.isnan(rows[:, COLUMN_INDEX[c]]).all()]
+    missing = [c for c in _OPTIONAL if bool(xp.isnan(rows[:, COLUMN_INDEX[c]]).all())]
     if missing:
         log.info("%s: no %s (kept as NaN)", source.name, ", ".join(missing))
 
-    keep = np.isfinite(rows[:, _REQUIRED_IDX]).all(axis=1)
+    keep = xp.isfinite(rows[:, _REQUIRED_IDX[0]])
+    for idx in _REQUIRED_IDX[1:]:      # per-column: no fancy-index copy of the slice
+        keep = keep & xp.isfinite(rows[:, idx])
     dropped = int((~keep).sum())
     if dropped:
         log.info("%s: dropped %d/%d rows missing a required coord/time",
-                 source.name, dropped, len(rows))
+                 source.name, dropped, rows.shape[0])
     return rows[keep]
 
 
-def _assemble(chunk: Chunk, source_code: int) -> np.ndarray:
-    """Stack canonical columns into a 2-D array; missing physical columns are NaN.
-
-    The ``source`` column is filled with ``source_code`` for every row.
-    """
+def _assemble(chunk: Chunk, source_code: int, empty=None) -> np.ndarray:
+    """Fill canonical columns into one pre-allocated (rows x NCOL) array; missing
+    columns are NaN. ``empty(shape)`` allocates on the target device (numpy default;
+    the GPU path passes a torch allocator)."""
     present = {k: v for k, v in chunk.items() if k in CANONICAL_COLUMNS}
+    ncol = len(CANONICAL_COLUMNS)
+    make = empty if empty is not None else (lambda shape: np.empty(shape, np.float64))
     if not present:
-        return np.empty((0, len(CANONICAL_COLUMNS)), dtype=np.float64)
+        return make((0, ncol))
 
     n_rows = len(next(iter(present.values())))
-    columns = []
-    for name in CANONICAL_COLUMNS:
+    out = make((n_rows, ncol))
+    for j, name in enumerate(CANONICAL_COLUMNS):
         if name == "source":
-            columns.append(np.full(n_rows, source_code, dtype=np.float64))
+            out[:, j] = source_code
         elif name in present:
-            columns.append(np.asarray(present[name], dtype=np.float64))
+            out[:, j] = present[name]
         else:
-            columns.append(np.full(n_rows, np.nan, dtype=np.float64))
-    return np.column_stack(columns)
+            out[:, j] = float("nan")
+    return out
 
 
 #: name -> function taking the stacked finite-column stats (min, max) and

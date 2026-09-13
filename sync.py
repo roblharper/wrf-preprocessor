@@ -91,23 +91,22 @@ def match_snapshots(
     snapshots,
     *,
     tolerance_s: float = TIME_TOLERANCE_SECONDS,
+    xp=np,
 ) -> tuple[dict[str, np.ndarray], np.ndarray]:
     """Split one block into per-snapshot matching rows, without holding state.
 
-    ``snapshots`` may be a dict or a ``SnapshotIndex``. Returns
-    ``({cid: rows}, matched_mask)``; a row may match several snapshots and appears
-    in each. Only snapshots within the block's time window are tested.
-    """
+    ``snapshots`` may be a dict or a ``SnapshotIndex``; a row may match several
+    snapshots and appears in each. ``xp`` is numpy (CPU) or torch (GPU)."""
     index = snapshots if isinstance(snapshots, SnapshotIndex) \
         else SnapshotIndex(snapshots, tolerance_s=tolerance_s)
     t = block[:, _T]
-    matched_any = np.zeros(len(block), dtype=bool)
+    matched_any = xp.isfinite(t) & False   # all-False mask on t's device/backend
     per_case: dict[str, np.ndarray] = {}
     for cid, snap in index.candidates(float(t.min()), float(t.max())):
-        keep = (np.abs(t - snap.time) <= tolerance_s) & _within_bbox(block, snap.bbox)
-        if keep.any():
+        keep = (xp.abs(t - snap.time) <= tolerance_s) & _within_bbox(block, snap.bbox)
+        if bool(keep.any()):
             per_case[cid] = block[keep]
-            matched_any |= keep
+            matched_any = matched_any | keep
     return per_case, matched_any
 
 

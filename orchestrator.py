@@ -19,6 +19,7 @@ from reader import discover_files, read_file
 from processor import to_canonical, anchor_points, Normalizer, RunningMinMax
 from sync import build_snapshots, match_snapshots, SnapshotIndex
 from writer import CaseWriter
+from device import array_module, to_numpy
 
 log = logging.getLogger(__name__)
 
@@ -26,14 +27,13 @@ log = logging.getLogger(__name__)
 def run(
     input_root: Path, out_dir: Path, *, chunk_size: int = 1,
     test_fraction: float = 0.2, seed: int = 0, progress=None, spill_dir=None,
-    time_tolerance_s: float = TIME_TOLERANCE_SECONDS,
+    time_tolerance_s: float = TIME_TOLERANCE_SECONDS, device: str = "cpu",
 ) -> dict[str, list[Path]]:
     """Run the full pipeline; return the written train/ and test/ case files.
 
-    ``progress(phase, done, total)`` is called (if given) as files are read and
-    cases are written, so long runs are not a silent terminal. ``spill_dir`` sets
-    where pass-1 row spills go (default: system temp); point it at scratch on HPC,
-    /tmp on a compute node is often tiny or RAM-backed.
+    ``device`` runs the per-block math on 'cpu' (numpy) or a GPU ('cuda'); I/O
+    (NetCDF read, .npy write) stays on the CPU. ``progress(phase, done, total)``
+    reports read/write progress; ``spill_dir`` sets where pass-1 spills go.
     """
     def _tick(phase, done, total):
         if progress is not None:
@@ -58,12 +58,13 @@ def run(
         kept = dropped = 0
         data_files = [(p, s) for p, s in files if not s.is_anchor]
         _tick("read", 0, len(data_files))   # show the phase started before file 1
+        xp = array_module(device)
         for i, (path, src) in enumerate(data_files, 1):
-            for chunk in read_file(path, src, chunk_size=chunk_size):
-                block = to_canonical(chunk, src)
-                if not block.size:
+            for chunk in read_file(path, src, chunk_size=chunk_size, device=device):
+                block = to_canonical(chunk, src, device)
+                if block.shape[0] == 0:
                     continue
-                k, d = spills.route(block, index, stats)
+                k, d = spills.route(block, index, stats, xp=xp)
                 kept += k; dropped += d
             _tick("read", i, len(data_files))
 
@@ -92,16 +93,18 @@ class _SpillSet:
         self._root = root
         self._counts = {cid: 0 for cid in snapshots}
 
-    def route(self, block: np.ndarray, snapshots, stats: RunningMinMax) -> tuple[int, int]:
-        """Append each snapshot's matching rows to its spill; update global stats."""
-        kept, matched = match_snapshots(block, snapshots)  # {cid: rows}, bool mask
+    def route(self, block, snapshots, stats: RunningMinMax, xp=np) -> tuple[int, int]:
+        """Match block to snapshots on ``xp``, then spill each case's rows as host
+        numpy (stats + disk are CPU)."""
+        kept, matched = match_snapshots(block, snapshots, xp=xp)  # {cid: rows}, mask
         for cid, rows in kept.items():
+            rows = to_numpy(rows)              # device -> host at the spill boundary
             stats.update(rows)
             with open(self._root / f"{cid}.npy.part", "ab") as fh:
                 fh.write(np.ascontiguousarray(rows).tobytes())
             self._counts[cid] += len(rows)
         n_kept = int(matched.sum())
-        return n_kept, len(block) - n_kept
+        return n_kept, int(block.shape[0]) - n_kept
 
     @property
     def n_nonempty(self) -> int:
@@ -134,6 +137,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="Fraction of cases held out for testing (default 0.2).")
     parser.add_argument("--seed", type=int, default=0,
                         help="Seed for the reproducible train/test split.")
+    parser.add_argument("--device", default="cpu",
+                        help="Compute device for block math: 'cpu' or 'cuda' (default cpu).")
     parser.add_argument("-v", "--verbose", action="count", default=0,
                         help="-v for progress (INFO), -vv for filtering detail (DEBUG).")
     args = parser.parse_args(argv)
@@ -142,7 +147,7 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=level, format="%(levelname)s %(name)s: %(message)s")
 
     written = run(args.input_root, args.out_dir, chunk_size=args.chunk_size,
-                  test_fraction=args.test_fraction, seed=args.seed)
+                  test_fraction=args.test_fraction, seed=args.seed, device=args.device)
     print(f"Wrote {len(written['train'])} train + {len(written['test'])} test "
           f"case(s) + metadata.json to {args.out_dir}")
     return 0

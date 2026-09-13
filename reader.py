@@ -10,6 +10,7 @@ import numpy as np
 import netCDF4
 
 from config import SourceType, match_source
+from device import array_module, to_device
 
 log = logging.getLogger(__name__)
 
@@ -45,8 +46,10 @@ def discover_files(input_root: Path) -> list[tuple[Path, SourceType]]:
     return matched
 
 
-def read_file(path: Path, source: SourceType, *, chunk_size: int = 1) -> Iterator[Chunk]:
-    """Stream a file in blocks along ``chunk_dim`` (never loaded whole)."""
+def read_file(path: Path, source: SourceType, *, chunk_size: int = 1,
+              device: str = "cpu") -> Iterator[Chunk]:
+    """Stream a file in blocks along ``chunk_dim`` (never loaded whole). ``device``
+    selects where the block math runs: 'cpu' (numpy) or a GPU device (torch)."""
     ds = netCDF4.Dataset(path)
     try:
         if source.chunk_dim not in ds.dimensions:
@@ -56,13 +59,15 @@ def read_file(path: Path, source: SourceType, *, chunk_size: int = 1) -> Iterato
             )
         n = len(ds.dimensions[source.chunk_dim])
         for start in range(0, n, chunk_size):
-            yield _read_block(ds, source, start, min(start + chunk_size, n))
+            yield _read_block(ds, source, start, min(start + chunk_size, n), device)
     finally:
         ds.close()
 
 
-def _read_block(ds: "netCDF4.Dataset", source: SourceType, start: int, stop: int) -> Chunk:
-    """Read the column_map + derive_inputs variables for [start, stop)."""
+def _read_block(ds: "netCDF4.Dataset", source: SourceType, start: int, stop: int,
+                device: str = "cpu") -> Chunk:
+    """Read the column_map + derive_inputs variables for [start, stop) onto device."""
+    xp = array_module(device)
     wanted = list(source.column_map.items()) + [(v, v) for v in source.derive_inputs]
     sliced: dict[str, tuple[np.ndarray, tuple[str, ...]]] = {}
     for out_key, varname in wanted:
@@ -70,8 +75,9 @@ def _read_block(ds: "netCDF4.Dataset", source: SourceType, start: int, stop: int
             arr, dims = _slice_along(ds.variables[varname], source.chunk_dim, start, stop)
             if arr.dtype.kind == "S":                       # WRF Times char array
                 arr, dims = _parse_time_strings(arr, dims, source.chunk_dim)
-            sliced[out_key] = _destagger(arr, dims)
-    return _broadcast_to_rows(sliced)
+            arr, dims = _destagger(to_device(arr, device), dims, xp)
+            sliced[out_key] = (arr, dims)
+    return _broadcast_to_rows(sliced, xp)
 
 
 def _parse_time_strings(
@@ -97,21 +103,24 @@ _STAGGER_MAP = {
 }
 
 
-def _destagger(arr: np.ndarray, dims: tuple[str, ...]) -> tuple[np.ndarray, tuple[str, ...]]:
+def _destagger(arr: np.ndarray, dims: tuple[str, ...], xp=np) -> tuple[np.ndarray, tuple[str, ...]]:
     """Average staggered (cell-face) axes onto the mass grid so dim names align.
-
-    WRF winds live on faces (e.g. U on ``west_east_stag`` = N+1), scalars on
-    centres (``west_east`` = N). Without this the reader broadcasts the two as
-    different axes and the row grid explodes to their outer product.
-    """
+    Winds live on faces (N+1), scalars on centres (N). ``xp`` is numpy or torch."""
     out_dims = list(dims)
     for i, d in enumerate(dims):
         if d in _STAGGER_MAP:
-            lo = np.take(arr, range(0, arr.shape[i] - 1), axis=i)
-            hi = np.take(arr, range(1, arr.shape[i]), axis=i)
+            lo = arr[_axis_slice(arr.ndim, i, 0, arr.shape[i] - 1)]
+            hi = arr[_axis_slice(arr.ndim, i, 1, arr.shape[i])]
             arr = 0.5 * (lo + hi)
             out_dims[i] = _STAGGER_MAP[d]
     return arr, tuple(out_dims)
+
+
+def _axis_slice(ndim: int, axis: int, start: int, stop: int) -> tuple:
+    """Index tuple selecting [start:stop] on one axis, full slices elsewhere."""
+    idx = [slice(None)] * ndim
+    idx[axis] = slice(start, stop)
+    return tuple(idx)
 
 
 def _slice_along(
@@ -125,12 +134,9 @@ def _slice_along(
     return np.asarray(var[...]), tuple(var.dimensions)
 
 
-def _broadcast_to_rows(sliced: dict[str, tuple[np.ndarray, tuple[str, ...]]]) -> Chunk:
+def _broadcast_to_rows(sliced: dict[str, tuple[np.ndarray, tuple[str, ...]]], xp=np) -> Chunk:
     """Expand every column onto a common grid by dimension name, then flatten.
-
-    Broadcasting by name (not trailing-aligned) so a per-time coordinate tiles
-    across the spatial axes rather than landing on the wrong axis.
-    """
+    Broadcasting by name (not trailing-aligned) keeps each value on its axis."""
     if not sliced:
         return {}
 
@@ -142,7 +148,7 @@ def _broadcast_to_rows(sliced: dict[str, tuple[np.ndarray, tuple[str, ...]]]) ->
 
     target_shape = _target_shape(sliced, axis_order)
     return {
-        column: np.broadcast_to(_place_on_axes(arr, dims, axis_order), target_shape).reshape(-1)
+        column: xp.broadcast_to(_place_on_axes(arr, dims, axis_order), target_shape).reshape(-1)
         for column, (arr, dims) in sliced.items()
     }
 
