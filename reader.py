@@ -9,8 +9,9 @@ from typing import Iterator
 import numpy as np
 import netCDF4
 
+from time import perf_counter as _t
 from config import SourceType, match_source
-from device import array_module, to_device
+from device import array_module, to_device, sync as _sync, _DEBUG
 
 log = logging.getLogger(__name__)
 
@@ -70,14 +71,22 @@ def _read_block(ds: "netCDF4.Dataset", source: SourceType, start: int, stop: int
     xp = array_module(device)
     wanted = list(source.column_map.items()) + [(v, v) for v in source.derive_inputs]
     sliced: dict[str, tuple[np.ndarray, tuple[str, ...]]] = {}
+    t = {"nc_read": 0.0, "transfer": 0.0, "destagger": 0.0}
     for out_key, varname in wanted:
         if varname in ds.variables:
+            t0 = _t()
             arr, dims = _slice_along(ds.variables[varname], source.chunk_dim, start, stop)
-            if arr.dtype.kind == "S":                       # WRF Times char array
+            if arr.dtype.kind == "S":
                 arr, dims = _parse_time_strings(arr, dims, source.chunk_dim)
-            arr, dims = _destagger(to_device(arr, device), dims, xp)
+            t["nc_read"] += _t() - t0
+            t0 = _t(); arr = to_device(arr, device); _sync(device); t["transfer"] += _t() - t0
+            t0 = _t(); arr, dims = _destagger(arr, dims, xp); _sync(device); t["destagger"] += _t() - t0
             sliced[out_key] = (arr, dims)
-    return _broadcast_to_rows(sliced, xp)
+    t0 = _t(); rows = _broadcast_to_rows(sliced, xp); _sync(device)
+    if _DEBUG:
+        print(f"      [t] nc_read={t['nc_read']:.3f} transfer={t['transfer']:.3f} "
+              f"destagger={t['destagger']:.3f} broadcast={_t()-t0:.3f}", flush=True)
+    return rows
 
 
 def _parse_time_strings(

@@ -19,7 +19,7 @@ from reader import discover_files, read_file
 from processor import to_canonical, anchor_points, Normalizer, RunningMinMax
 from sync import build_snapshots, match_snapshots, SnapshotIndex
 from writer import CaseWriter
-from device import array_module, to_numpy
+from device import array_module, to_numpy, step
 
 log = logging.getLogger(__name__)
 
@@ -96,10 +96,12 @@ def _canonical_matched(files, index, device, chunk_size, tolerance_s):
     xp = array_module(device)
     for path, src in files:
         for chunk in read_file(path, src, chunk_size=chunk_size, device=device):
-            block = to_canonical(chunk, src, device)
+            with step("canonical", device):
+                block = to_canonical(chunk, src, device)
             if block.shape[0] == 0:
                 continue
-            kept, _ = match_snapshots(block, index, tolerance_s=tolerance_s, xp=xp)
+            with step("match", device):
+                kept, _ = match_snapshots(block, index, tolerance_s=tolerance_s, xp=xp)
             for cid, rows in kept.items():
                 yield cid, rows
 
@@ -138,7 +140,10 @@ def _run_resident_batched(data_files, snapshots, index, out_dir, *, chunk_size,
             cases.setdefault(cid, []).append(rows)
         for cid, parts in cases.items():
             rows = parts[0] if len(parts) == 1 else _cat(parts, device)
-            writer.add(cid, normalizer.transform(to_numpy(rows)))
+            with step("dev_to_host", device):
+                host = to_numpy(rows)
+            with step("normalize+write", device):
+                writer.add(cid, normalizer.transform(host))
             written += 1
             tick("write", written, len(ids))
         cases.clear()   # free this batch before the next

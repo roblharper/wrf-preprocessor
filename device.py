@@ -3,7 +3,33 @@ CPU uses numpy; a GPU device uses torch. Only the swap points live here."""
 
 from __future__ import annotations
 
+import os
+import time
+
 import numpy as np
+
+_DEBUG = bool(os.environ.get("PREPROC_DEBUG"))
+
+
+def sync(device: str) -> None:
+    """Block until queued GPU work finishes, so timers measure real cost."""
+    if device != "cpu":
+        import torch
+        torch.cuda.synchronize()
+
+
+def step(label: str, device: str = "cpu"):
+    """Context manager: print '[t] label: X.XXs' when PREPROC_DEBUG is set. GPU
+    work is synced first so the time is real, not just kernel-launch."""
+    class _S:
+        def __enter__(self):
+            self.t0 = time.perf_counter()
+            return self
+        def __exit__(self, *a):
+            if _DEBUG:
+                sync(device)
+                print(f"      [t] {label}: {time.perf_counter() - self.t0:.3f}s", flush=True)
+    return _S()
 
 
 def array_module(device: str):
