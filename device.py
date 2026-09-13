@@ -18,9 +18,17 @@ def sync(device: str) -> None:
         torch.cuda.synchronize()
 
 
+def gpu_mem_gb(device: str) -> float:
+    """Current GPU allocated memory in GiB (0 on cpu)."""
+    if device == "cpu":
+        return 0.0
+    import torch
+    return torch.cuda.memory_allocated() / 2**30
+
+
 def step(label: str, device: str = "cpu"):
-    """Context manager: print '[t] label: X.XXs' when PREPROC_DEBUG is set. GPU
-    work is synced first so the time is real, not just kernel-launch."""
+    """Context manager: print '[t] label: X.XXs  mem=X.XGiB' when PREPROC_DEBUG is
+    set. GPU work is synced first so time + memory are real, not kernel-launch."""
     class _S:
         def __enter__(self):
             self.t0 = time.perf_counter()
@@ -28,7 +36,8 @@ def step(label: str, device: str = "cpu"):
         def __exit__(self, *a):
             if _DEBUG:
                 sync(device)
-                print(f"      [t] {label}: {time.perf_counter() - self.t0:.3f}s", flush=True)
+                print(f"      [t] {label}: {time.perf_counter() - self.t0:.3f}s"
+                      f"  mem={gpu_mem_gb(device):.2f}GiB", flush=True)
     return _S()
 
 

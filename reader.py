@@ -11,7 +11,7 @@ import netCDF4
 
 from time import perf_counter as _t
 from config import SourceType, match_source
-from device import array_module, to_device, sync as _sync, _DEBUG
+from device import array_module, to_device, sync as _sync, gpu_mem_gb as _gpu_mem_gb, _DEBUG
 
 log = logging.getLogger(__name__)
 
@@ -85,7 +85,8 @@ def _read_block(ds: "netCDF4.Dataset", source: SourceType, start: int, stop: int
     t0 = _t(); rows = _broadcast_to_rows(sliced, xp); _sync(device)
     if _DEBUG:
         print(f"      [t] nc_read={t['nc_read']:.3f} transfer={t['transfer']:.3f} "
-              f"destagger={t['destagger']:.3f} broadcast={_t()-t0:.3f}", flush=True)
+              f"destagger={t['destagger']:.3f} broadcast={_t()-t0:.3f} "
+              f"mem={_gpu_mem_gb(device):.2f}GiB", flush=True)
     return rows
 
 
