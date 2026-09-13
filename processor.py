@@ -12,7 +12,7 @@ from config import (
     CANONICAL_COLUMNS, COLUMN_INDEX, PHYSICAL_COLUMNS, REQUIRED_COLUMNS, SourceType,
 )
 from reader import Chunk
-from device import array_module, make_empty
+from device import array_module, make_empty, to_numpy as _to_host
 
 log = logging.getLogger(__name__)
 
@@ -129,23 +129,40 @@ class RunningMinMax:
     """Streaming per-column NaN-aware min/max, so global stats need no full stack.
 
     Feed row blocks one at a time; peak memory is one block, not the whole set.
+    Blocks may be numpy (cpu) or torch (gpu): the accumulator lives on the block's
+    own device, so the GPU path needs no host round-trip until ``result()``.
     """
 
     def __init__(self, n_cols: int) -> None:
-        self._min = np.full(n_cols, np.inf)
-        self._max = np.full(n_cols, -np.inf)
+        self._n = n_cols
+        self._min = None    # lazily created on the first block's device/backend
+        self._max = None
 
-    def update(self, block: np.ndarray) -> None:
-        if block.size == 0:
+    def update(self, block, xp=np) -> None:
+        if block.shape[0] == 0:
             return
-        with warnings.catch_warnings():   # all-NaN columns are expected (optional cols)
-            warnings.simplefilter("ignore", RuntimeWarning)
-            self._min = np.fmin(self._min, np.nanmin(block, axis=0))
-            self._max = np.fmax(self._max, np.nanmax(block, axis=0))
+        if self._min is None:
+            self._min = xp.full((self._n,), float("inf"), dtype=block.dtype)
+            self._max = xp.full((self._n,), float("-inf"), dtype=block.dtype)
+        # NaN-aware min/max without nanmin (torch lacks it): mask NaNs to +/-inf.
+        # xp.amin/amax are module funcs on both numpy and torch (dim kw differs).
+        big, small = float("inf"), float("-inf")
+        if xp is np:
+            bmin = np.amin(np.where(np.isnan(block), big, block), axis=0)
+            bmax = np.amax(np.where(np.isnan(block), small, block), axis=0)
+        else:
+            bmin = xp.amin(xp.where(xp.isnan(block), big, block), dim=0)
+            bmax = xp.amax(xp.where(xp.isnan(block), small, block), dim=0)
+        self._min = xp.minimum(self._min, bmin)
+        self._max = xp.maximum(self._max, bmax)
 
     def result(self) -> tuple[np.ndarray, np.ndarray]:
-        seen = np.isfinite(self._min) & np.isfinite(self._max)
-        return np.where(seen, self._min, np.nan), np.where(seen, self._max, np.nan)
+        if self._min is None:
+            empty = np.full(self._n, np.nan)
+            return empty, empty.copy()
+        cmin, cmax = _to_host(self._min), _to_host(self._max)   # one small D2H (len n_cols)
+        seen = np.isfinite(cmin) & np.isfinite(cmax)
+        return np.where(seen, cmin, np.nan), np.where(seen, cmax, np.nan)
 
 
 class Normalizer:

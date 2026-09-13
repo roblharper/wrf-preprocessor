@@ -100,14 +100,14 @@ def match_snapshots(
     index = snapshots if isinstance(snapshots, SnapshotIndex) \
         else SnapshotIndex(snapshots, tolerance_s=tolerance_s)
     t = block[:, _T]
+    t_lo, t_hi = float(t.min()), float(t.max())   # one sync per block, not per candidate
     matched_any = xp.isfinite(t) & False   # all-False mask on t's device/backend
     per_case: dict[str, np.ndarray] = {}
-    for cid, snap in index.candidates(float(t.min()), float(t.max())):
+    for cid, snap in index.candidates(t_lo, t_hi):
         keep = (xp.abs(t - snap.time) <= tolerance_s) & _within_bbox(block, snap.bbox)
-        if bool(keep.any()):
-            per_case[cid] = block[keep]
-            matched_any = matched_any | keep
-    return per_case, matched_any
+        per_case[cid] = block[keep]        # keep the gather; may be empty (no sync)
+        matched_any = matched_any | keep
+    return {cid: rows for cid, rows in per_case.items() if rows.shape[0]}, matched_any
 
 
 def attach_data(

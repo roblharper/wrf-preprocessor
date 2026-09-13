@@ -68,7 +68,7 @@ def run(
                 block = to_canonical(chunk, src)
                 if block.shape[0] == 0:
                     continue
-                k, d = spills.route(block, index, stats)
+                k, d = spills.route(block, index, stats)  # CPU: stats fed host numpy
                 kept += k; dropped += d
             _tick("read", i, len(data_files))
 
@@ -117,13 +117,14 @@ def _run_resident_batched(data_files, snapshots, index, out_dir, *, chunk_size,
 
     # pass 1: global min/max + case ids. Single-pass retains the rows resident.
     stats = RunningMinMax(len(CANONICAL_COLUMNS))
+    xp = array_module(device)
     ids: list[str] = []
     held: dict[str, list] = {}
     tick("read", 0, len(data_files))
     done = 0
     for batch in batches:
         for cid, rows in _canonical_matched(batch, index, device, chunk_size, time_tolerance_s):
-            stats.update(to_numpy(rows))
+            stats.update(rows, xp)      # on-device: no per-case D2H copy
             if cid not in ids:
                 ids.append(cid)
             if single_pass:
