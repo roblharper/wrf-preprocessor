@@ -19,11 +19,13 @@ class CaseWriter:
     """
 
     def __init__(self, out_dir: Path, normalization_recipe: dict, case_ids, *,
-                 test_fraction: float = 0.2, seed: int = 0) -> None:
+                 test_fraction: float = 0.2, seed: int = 0,
+                 time_tolerance_s: float = TIME_TOLERANCE_SECONDS) -> None:
         self._out = out_dir
         self._recipe = normalization_recipe
         self._test_fraction = test_fraction
         self._seed = seed
+        self._tolerance = time_tolerance_s
         train_ids, test_ids = _split_ids(sorted(case_ids), test_fraction, seed)
         self._group = {cid: "train" for cid in train_ids}
         self._group.update({cid: "test" for cid in test_ids})
@@ -43,7 +45,7 @@ class CaseWriter:
 
     def finalize(self) -> dict[str, list[Path]]:
         _write_metadata(self._out, self._recipe, self._counts, self._written,
-                        self._test_fraction, self._seed)
+                        self._test_fraction, self._seed, self._tolerance)
         return self._written
 
 
@@ -89,6 +91,7 @@ def _write_metadata(
     written: dict[str, list[Path]],
     test_fraction: float,
     seed: int,
+    time_tolerance_s: float = TIME_TOLERANCE_SECONDS,
 ) -> None:
     metadata = {
         "schema": {
@@ -100,7 +103,7 @@ def _write_metadata(
         },
         "case_definition": {
             "unit": "one HRRR snapshot plus co-located, co-temporal LES/sensor rows",
-            "time_tolerance_seconds": TIME_TOLERANCE_SECONDS,
+            "time_tolerance_seconds": time_tolerance_s,
             "space_match": "inside the HRRR snapshot's x/y bounding box",
             "unmatched_rows": "dropped",
         },

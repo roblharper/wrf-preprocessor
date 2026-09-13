@@ -14,7 +14,7 @@ from pathlib import Path
 
 import numpy as np
 
-from config import CANONICAL_COLUMNS
+from config import CANONICAL_COLUMNS, TIME_TOLERANCE_SECONDS
 from reader import discover_files, read_file
 from processor import to_canonical, anchor_points, Normalizer, RunningMinMax
 from sync import build_snapshots, match_snapshots, SnapshotIndex
@@ -26,6 +26,7 @@ log = logging.getLogger(__name__)
 def run(
     input_root: Path, out_dir: Path, *, chunk_size: int = 1,
     test_fraction: float = 0.2, seed: int = 0, progress=None, spill_dir=None,
+    time_tolerance_s: float = TIME_TOLERANCE_SECONDS,
 ) -> dict[str, list[Path]]:
     """Run the full pipeline; return the written train/ and test/ case files.
 
@@ -51,7 +52,7 @@ def run(
     with tempfile.TemporaryDirectory(prefix="preproc_spill_", dir=spill_dir) as spill:
         stats = RunningMinMax(len(CANONICAL_COLUMNS))
         spills = _SpillSet(Path(spill), snapshots)
-        index = SnapshotIndex(snapshots)   # time-indexed; built once, not per chunk
+        index = SnapshotIndex(snapshots, tolerance_s=time_tolerance_s)
 
         # pass 1: read data files once, route rows to per-snapshot spills + stats.
         kept = dropped = 0
@@ -73,7 +74,8 @@ def run(
         # pass 2: reload one case at a time, normalize, write, free.
         ids = spills.nonempty_ids()
         writer = CaseWriter(out_dir, normalizer.recipe(), ids,
-                            test_fraction=test_fraction, seed=seed)
+                            test_fraction=test_fraction, seed=seed,
+                            time_tolerance_s=time_tolerance_s)
         for i, cid in enumerate(ids, 1):
             rows = spills.load(cid)
             writer.add(cid, normalizer.transform(rows))
