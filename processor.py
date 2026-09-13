@@ -141,20 +141,17 @@ class RunningMinMax:
     def update(self, block, xp=np) -> None:
         if block.shape[0] == 0:
             return
-        if self._min is None:
-            self._min = xp.full((self._n,), float("inf"), dtype=block.dtype)
-            self._max = xp.full((self._n,), float("-inf"), dtype=block.dtype)
         # NaN-aware min/max without nanmin (torch lacks it): mask NaNs to +/-inf.
-        # xp.amin/amax are module funcs on both numpy and torch (dim kw differs).
-        big, small = float("inf"), float("-inf")
+        # amin/amax are module funcs on both numpy and torch (axis vs dim kw differs).
         if xp is np:
-            bmin = np.amin(np.where(np.isnan(block), big, block), axis=0)
-            bmax = np.amax(np.where(np.isnan(block), small, block), axis=0)
+            bmin = np.amin(np.where(np.isnan(block), np.inf, block), axis=0)
+            bmax = np.amax(np.where(np.isnan(block), -np.inf, block), axis=0)
         else:
-            bmin = xp.amin(xp.where(xp.isnan(block), big, block), dim=0)
-            bmax = xp.amax(xp.where(xp.isnan(block), small, block), dim=0)
-        self._min = xp.minimum(self._min, bmin)
-        self._max = xp.maximum(self._max, bmax)
+            bmin = xp.amin(xp.where(xp.isnan(block), float("inf"), block), dim=0)
+            bmax = xp.amax(xp.where(xp.isnan(block), float("-inf"), block), dim=0)
+        # seed from the first block (already on the right device/dtype), then fold.
+        self._min = bmin if self._min is None else xp.minimum(self._min, bmin)
+        self._max = bmax if self._max is None else xp.maximum(self._max, bmax)
 
     def result(self) -> tuple[np.ndarray, np.ndarray]:
         if self._min is None:
