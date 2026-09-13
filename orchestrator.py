@@ -151,8 +151,10 @@ def _run_resident_batched(data_files, snapshots, index, out_dir, *, chunk_size,
             rows = parts[0] if len(parts) == 1 else _cat(parts, device)
             with step("dev_to_host", device):
                 host = to_numpy(rows)
-            with step("normalize+write", device):
-                writer.add(cid, normalizer.transform(host))
+            with step("normalize", device):
+                norm = normalizer.transform(host)
+            with step("write", device):
+                writer.add(cid, norm)
             written += 1
             tick("write", written, len(ids))
         cases.clear()   # free this batch before the next
