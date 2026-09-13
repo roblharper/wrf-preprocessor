@@ -109,14 +109,16 @@ def _canonical_matched(files, index, device, chunk_size, tolerance_s):
 def _run_resident_batched(data_files, snapshots, index, out_dir, *, chunk_size,
                           test_fraction, seed, tick, time_tolerance_s, device,
                           batch_size):
-    """GPU path: process ``batch_size`` cases resident at a time so peak device
-    memory is one batch (user-capped). Two passes over the files: global stats,
-    then normalize + write. No disk spill."""
+    """GPU path. If all cases fit one batch, read once and hold them resident
+    through stats + normalize + write (single pass). Otherwise process batch_size
+    cases at a time, re-reading in pass 2 (bounded device memory, no disk spill)."""
     batches = [data_files[i:i + batch_size] for i in range(0, len(data_files), batch_size)]
+    single_pass = len(batches) <= 1
 
-    # pass 1: global min/max + case ids, one batch resident at a time then freed.
+    # pass 1: global min/max + case ids. Single-pass retains the rows resident.
     stats = RunningMinMax(len(CANONICAL_COLUMNS))
     ids: list[str] = []
+    held: dict[str, list] = {}
     tick("read", 0, len(data_files))
     done = 0
     for batch in batches:
@@ -124,6 +126,8 @@ def _run_resident_batched(data_files, snapshots, index, out_dir, *, chunk_size,
             stats.update(to_numpy(rows))
             if cid not in ids:
                 ids.append(cid)
+            if single_pass:
+                held.setdefault(cid, []).append(rows)
         done += len(batch)
         tick("read", done, len(data_files))
     normalizer = Normalizer.from_stats(*stats.result(), method="minmax_01")
@@ -132,12 +136,16 @@ def _run_resident_batched(data_files, snapshots, index, out_dir, *, chunk_size,
                         test_fraction=test_fraction, seed=seed,
                         time_tolerance_s=time_tolerance_s)
 
-    # pass 2: one batch resident at a time -> normalize -> write -> free.
+    # pass 2: normalize + write. Single-pass uses the held rows (no re-read);
+    # otherwise re-read one batch at a time.
     written = 0
     for batch in batches:
-        cases: dict[str, list] = {}
-        for cid, rows in _canonical_matched(batch, index, device, chunk_size, time_tolerance_s):
-            cases.setdefault(cid, []).append(rows)
+        if single_pass:
+            cases = held
+        else:
+            cases = {}
+            for cid, rows in _canonical_matched(batch, index, device, chunk_size, time_tolerance_s):
+                cases.setdefault(cid, []).append(rows)
         for cid, parts in cases.items():
             rows = parts[0] if len(parts) == 1 else _cat(parts, device)
             with step("dev_to_host", device):
