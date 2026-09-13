@@ -136,6 +136,7 @@ def _run_resident_batched(data_files, snapshots, index, out_dir, *, chunk_size,
     writer = CaseWriter(out_dir, normalizer.recipe(), ids,
                         test_fraction=test_fraction, seed=seed,
                         time_tolerance_s=time_tolerance_s)
+    dev_norm = normalizer.on_device(device)   # offset/scale resident, normalize on GPU
 
     # pass 2: normalize + write. Single-pass uses the held rows (no re-read);
     # otherwise re-read one batch at a time.
@@ -149,12 +150,12 @@ def _run_resident_batched(data_files, snapshots, index, out_dir, *, chunk_size,
                 cases.setdefault(cid, []).append(rows)
         for cid, parts in cases.items():
             rows = parts[0] if len(parts) == 1 else _cat(parts, device)
+            with step("normalize", device):        # on-device math, before the copy
+                rows = dev_norm.transform(rows)
             with step("dev_to_host", device):
                 host = to_numpy(rows)
-            with step("normalize", device):
-                norm = normalizer.transform(host)
             with step("write", device):
-                writer.add(cid, norm)
+                writer.add(cid, host)
             written += 1
             tick("write", written, len(ids))
         cases.clear()   # free this batch before the next

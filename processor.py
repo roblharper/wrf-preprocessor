@@ -12,7 +12,7 @@ from config import (
     CANONICAL_COLUMNS, COLUMN_INDEX, PHYSICAL_COLUMNS, REQUIRED_COLUMNS, SourceType,
 )
 from reader import Chunk
-from device import array_module, make_empty, to_numpy as _to_host
+from device import array_module, make_empty, to_numpy as _to_host, to_device as to_device_arr
 
 log = logging.getLogger(__name__)
 
@@ -211,6 +211,15 @@ class Normalizer:
 
     def transform(self, data: np.ndarray) -> np.ndarray:
         return (data - self._offset) / self._scale
+
+    def on_device(self, device: str) -> "Normalizer":
+        """Return a copy whose offset/scale live on ``device`` so transform runs
+        there (GPU-side normalize before the host copy). recipe() stays host-side."""
+        if device == "cpu":
+            return self
+        off = to_device_arr(self._offset, device)
+        scale = to_device_arr(self._scale, device)
+        return Normalizer(off, scale, self._method)
 
     def recipe(self) -> dict:
         return {
