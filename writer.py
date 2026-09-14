@@ -1,4 +1,8 @@
-"""Write per-snapshot ``.npy`` cases into train/ and test/ + a metadata.json."""
+"""Write per-case ``.npy`` into train/ and test/ + a metadata.json.
+
+Also holds the mergeable-stats seam: each case drops a tiny stats sidecar in
+phase 1; ``consolidate_stats`` merges them into one global min/max for the recipe.
+"""
 
 from __future__ import annotations
 
@@ -7,25 +11,60 @@ from pathlib import Path
 
 import numpy as np
 
-from config import CANONICAL_COLUMNS, TIME_TOLERANCE_SECONDS, SRC_SIM, SRC_SENSOR
+from config import CANONICAL_COLUMNS, SRC_SIM, SRC_SENSOR
+
+
+def write_case_stats(work: Path, case_id: str, col_min: np.ndarray,
+                     col_max: np.ndarray) -> None:
+    """Write a case's per-column min/max sidecar (NaN -> null) beside its raw .npy."""
+    (work / f"{case_id}.stats.json").write_text(json.dumps({
+        "columns": list(CANONICAL_COLUMNS),
+        "min": _jsonable(col_min),
+        "max": _jsonable(col_max),
+    }))
+
+
+def consolidate_stats(work: Path, case_ids) -> tuple[np.ndarray, np.ndarray]:
+    """Merge every case's stats sidecar into one global (min, max) per column.
+
+    NaN entries (a column no case in this id ever supplied) stay NaN; the
+    Normalizer maps such columns to the identity.
+    """
+    ncol = len(CANONICAL_COLUMNS)
+    gmin = np.full(ncol, np.nan)
+    gmax = np.full(ncol, np.nan)
+    for cid in case_ids:
+        s = json.loads((work / f"{cid}.stats.json").read_text())
+        cmin = _from_json(s["min"])
+        cmax = _from_json(s["max"])
+        gmin = np.fmin(gmin, cmin)   # fmin/fmax ignore NaN, so first real value wins
+        gmax = np.fmax(gmax, cmax)
+    return gmin, gmax
+
+
+def _jsonable(arr: np.ndarray) -> list:
+    return [None if not np.isfinite(v) else float(v) for v in arr]
+
+
+def _from_json(vals: list) -> np.ndarray:
+    return np.array([np.nan if v is None else v for v in vals], dtype=np.float64)
 
 
 class CaseWriter:
     """Stream cases straight into train/ or test/ (no staging copy).
 
     The train/test split is decided up front from the known case ids, so each
-    normalized case is written once to its final home. Peak RAM = one case,
-    peak extra disk = one case.
+    normalized case is written once to its final home. Peak RAM = one case.
     """
 
     def __init__(self, out_dir: Path, normalization_recipe: dict, case_ids, *,
                  test_fraction: float = 0.2, seed: int = 0,
-                 time_tolerance_s: float = TIME_TOLERANCE_SECONDS) -> None:
+                 hrrr_times: dict[str, float] | None = None) -> None:
         self._out = out_dir
         self._recipe = normalization_recipe
         self._test_fraction = test_fraction
         self._seed = seed
-        self._tolerance = time_tolerance_s
+        self._hrrr_times = hrrr_times or {}
         train_ids, test_ids = _split_ids(sorted(case_ids), test_fraction, seed)
         self._group = {cid: "train" for cid in train_ids}
         self._group.update({cid: "test" for cid in test_ids})
@@ -45,31 +84,8 @@ class CaseWriter:
 
     def finalize(self) -> dict[str, list[Path]]:
         _write_metadata(self._out, self._recipe, self._counts, self._written,
-                        self._test_fraction, self._seed, self._tolerance)
+                        self._test_fraction, self._seed, self._hrrr_times)
         return self._written
-
-
-def write_cases(
-    out_dir: Path,
-    cases: dict[str, np.ndarray],
-    normalization_recipe: dict,
-    *,
-    test_fraction: float = 0.2,
-    seed: int = 0,
-) -> dict[str, list[Path]]:
-    """Split cases (by whole case) into ``train/`` and ``test/`` and write them.
-
-    Returns ``{"train": [...], "test": [...]}``. The split is seeded and
-    reproducible; normalization is global (already applied), recorded once in the
-    shared metadata.json.
-    """
-
-    ids = [cid for cid, data in cases.items() if data.size]
-    writer = CaseWriter(out_dir, normalization_recipe, ids,
-                        test_fraction=test_fraction, seed=seed)
-    for cid, data in cases.items():
-        writer.add(cid, data)
-    return writer.finalize()
 
 
 def _split_ids(ids: list[str], test_fraction: float, seed: int) -> tuple[list[str], list[str]]:
@@ -91,7 +107,7 @@ def _write_metadata(
     written: dict[str, list[Path]],
     test_fraction: float,
     seed: int,
-    time_tolerance_s: float = TIME_TOLERANCE_SECONDS,
+    hrrr_times: dict[str, float],
 ) -> None:
     metadata = {
         "schema": {
@@ -102,15 +118,20 @@ def _write_metadata(
             "source_codes": {SRC_SIM: "simulation", SRC_SENSOR: "sensor"},
         },
         "case_definition": {
-            "unit": "one HRRR snapshot plus co-located, co-temporal LES/sensor rows",
-            "time_tolerance_seconds": time_tolerance_s,
-            "space_match": "inside the HRRR snapshot's x/y bounding box",
-            "unmatched_rows": "dropped",
+            "unit": "one input folder: an HRRR snapshot condition plus all LES/sensor rows placed in it",
+            "case_id": "the folder name",
+            "hrrr_role": "tags the case with its snapshot time; contributes no rows",
         },
         "split": {"test_fraction": test_fraction, "seed": seed},
         "normalization": normalization_recipe,
         "cases": {
-            group: {p.stem: counts[p.stem] for p in paths}
+            group: {
+                p.stem: {
+                    "rows": counts[p.stem],
+                    "hrrr_time": hrrr_times.get(p.stem),
+                }
+                for p in paths
+            }
             for group, paths in written.items()
         },
     }

@@ -1,7 +1,8 @@
-"""Generate phony ARM-named NetCDFs (one per structural type) for testing.
+"""Generate a folder-per-case phony input tree for testing.
 
-Includes >=2 of each core source at a shared timestamp, one off-timestamp, and
-deliberate off-time / off-location rows the pipeline must drop.
+Each case folder holds one HRRR file (tags the case time) plus one of every
+recognized LES/sensor type. Every file in a folder contributes rows
+unconditionally; there is no time/bbox matching to test.
 """
 
 from __future__ import annotations
@@ -166,57 +167,40 @@ def _write_dlaux(path: Path, *, times: np.ndarray, seed: int) -> None:
     ds.close()
 
 
-def generate(root: Path, *, seed: int = 0) -> dict:
-    """Build the phony input tree under ``root``; return a manifest for tests."""
-
-    for sub in ("hrrr", "sim", "obs"):
-        (root / sub).mkdir(parents=True, exist_ok=True)
-    off_time = SYNC_TIME + 7 * 3600.0
+def _write_case(folder: Path, *, valid_time: float, seed: int) -> None:
+    """Populate one case folder: HRRR tag + one file of every recognized type."""
+    folder.mkdir(parents=True, exist_ok=True)
     lon_c, lat_c = float(np.mean(REGION_LON)), float(np.mean(REGION_LAT))
-    in_window = SYNC_TIME + np.linspace(-600, 600, 20)          # within +/-30 min
-    out_window = SYNC_TIME + np.array([5 * 3600.0, 6 * 3600.0])  # outside window
-    straddle = np.concatenate([in_window, out_window])
+    times = valid_time + np.linspace(-600, 600, 20)   # sensor sampling around the tag
 
-    def n(kind, tag): return f"sgp{kind}{tag}C1.b1.20240710.000000"
-
-    # anchor: 2 at SYNC_TIME + 1 off-time
-    _write_hrrr(root / "hrrr" / "hrrr_a.nc", valid_time=SYNC_TIME, seed=seed + 1)
-    _write_hrrr(root / "hrrr" / "hrrr_b.nc", valid_time=SYNC_TIME, seed=seed + 2)
-    _write_hrrr(root / "hrrr" / "hrrr_off.nc", valid_time=off_time, seed=seed + 3)
-
-    # interior LES: 2 at SYNC_TIME + 1 off-time
-    _write_les(root / "sim" / "wrfout_a.nc", valid_time=SYNC_TIME, seed=seed + 4, lon_c=lon_c, lat_c=lat_c)
-    _write_les(root / "sim" / "wrfout_b.nc", valid_time=SYNC_TIME, seed=seed + 5, lon_c=lon_c, lat_c=lat_c)
-    _write_les(root / "sim" / "wrfout_off.nc", valid_time=off_time, seed=seed + 6, lon_c=lon_c, lat_c=lat_c)
-
-    o = root / "obs"
-    # ecor sonic wind: 2 in-region stations (straddle window) + off-time + far
-    _write_ecor(o / "ecorsfwind_a.nc", times=straddle, seed=seed + 7,
+    _write_hrrr(folder / "hrrr.nc", valid_time=valid_time, seed=seed + 1)
+    _write_les(folder / "wrfout_d01.nc", valid_time=valid_time, seed=seed + 4,
+               lon_c=lon_c, lat_c=lat_c)
+    _write_ecor(folder / "sgpecorsfwindC1.b1.nc", times=times, seed=seed + 7,
                 lon=lon_c - 0.02, lat=lat_c + 0.01, alt=320.0)
-    _write_ecor(o / "ecorsfwind_b.nc", times=in_window, seed=seed + 8,
-                lon=lon_c + 0.03, lat=lat_c - 0.02, alt=330.0)
-    _write_ecor(o / "ecorsfwind_off.nc", times=off_time + (in_window - SYNC_TIME),
-                seed=seed + 9, lon=lon_c, lat=lat_c, alt=325.0)
-    _write_ecor(o / "ecorsfwind_far.nc", times=in_window, seed=seed + 10,
-                lon=lon_c + 5.0, lat=lat_c + 5.0, alt=300.0)     # off-location
-
-    # one file of each remaining ARM type at the sync window (structural coverage)
-    _write_smos(o / "smos_a.nc", times=in_window, seed=seed + 11)          # no lat/lon -> no bbox match
-    _write_twr(o / "twr25m_a.nc", times=in_window, seed=seed + 12,
+    _write_smos(folder / "sgpsmosC1.b1.nc", times=times, seed=seed + 11)
+    _write_twr(folder / "sgptwr25mC1.b1.nc", times=times, seed=seed + 12,
                lon=lon_c - 0.01, lat=lat_c + 0.02, alt=316.0)
-    _write_co2flx(o / "co2flx4mmet_a.nc", times=in_window, seed=seed + 13)  # no lat/lon
-    _write_armbeatm(o / "armbeatm_a.nc", times=in_window, seed=seed + 14)   # no lat/lon
-    _write_dlaux(o / "dlaux_a.nc", times=in_window, seed=seed + 15)         # unmapped
+    _write_co2flx(folder / "sgpco2flx4mmetC1.b1.nc", times=times, seed=seed + 13)
+    _write_armbeatm(folder / "sgparmbeatmC1.c1.nc", times=times, seed=seed + 14)
+    _write_dlaux(folder / "sgpdlauxC1.b1.nc", times=times, seed=seed + 15)
+
+
+def generate(root: Path, *, seed: int = 0) -> dict:
+    """Build the folder-per-case tree under ``root``; return a manifest for tests."""
+
+    case_times = {"case_morning": SYNC_TIME, "case_afternoon": SYNC_TIME + 7 * 3600.0}
+    for i, (name, vt) in enumerate(case_times.items()):
+        _write_case(root / name, valid_time=vt, seed=seed + 100 * i)
 
     return {
-        "sync_time": SYNC_TIME,
-        "off_time": off_time,
+        "case_ids": sorted(case_times),
+        "hrrr_times": case_times,
         "region_lon": REGION_LON,
         "region_lat": REGION_LAT,
-        "in_window_times": in_window.tolist(),
-        "off_location_file": "ecorsfwind_far",
-        "off_time_file": "ecorsfwind_off",
-        "unmapped_file": "dlaux_a",
+        "unmapped_file": "sgpdlaux",
+        # every non-HRRR type placed in each case folder contributes rows
+        "data_types": ["wrfout", "ecorsfwind", "smos", "twr", "co2flx", "armbeatm"],
     }
 
 

@@ -1,13 +1,13 @@
 # WRF-PINN pre-processor
 
 Consolidates heterogeneous atmospheric NetCDF data into **one normalized binary
-per HRRR snapshot**, ready to load directly. All the differences between sources
+per case**, ready to load directly. All the differences between sources
 (variables, units, coordinates, resolutions) are resolved here, once, so a
 consumer sees exactly one format.
 
 ## What it produces
 
-For each HRRR snapshot it writes one `.npy` of rows in a fixed canonical schema:
+For each case it writes one `.npy` of rows in a fixed canonical schema:
 
 ```
 x, y, z, t, u, v, w, theta, p_prime, source
@@ -25,20 +25,23 @@ consumer can weight it per source.
 
 ## What a "case" is
 
-A case is **one HRRR snapshot**. HRRR is the **anchor condition**, not a data
-source: it defines each case's time window and x/y bounding box but contributes
-no rows of its own. The rows in a case come from the LES and sensor data that
-belong to that snapshot. "Belong to it" means:
+**A case is one input folder.** You lay out the input as
+`input_root/<case_name>/`, and each folder holds one HRRR file plus all the LES
+and sensor files you want in that case. The **folder name is the case id** (it
+must be unique). The tool assumes nothing about which data belongs where — the
+directory layout *declares* it. You already know the data↔snapshot association
+(you built the LES run for a specific HRRR inlet), so it is stated, not inferred.
 
-- **time:** within a tolerance window of the snapshot time
-  (`TIME_TOLERANCE_SECONDS`, default ±30 min);
-- **space:** inside the snapshot's x/y bounding box.
+HRRR is **not** a data source: it only **tags the case** with its snapshot time
+(recorded in `metadata.json` for traceability) and contributes no rows. Every
+non-HRRR file in a folder is data **unconditionally** — there is no time window,
+no bounding box, no matching. All rows from every file in the folder are
+concatenated into that case's table.
 
-Rows matching no snapshot are **dropped**, and a snapshot with no matching rows
-is skipped. Normalization is **global** and **affine**: one recipe
-(`value = offset + scale * normalized`) fit over all synced rows and applied to
+Normalization is **global** and **affine**: one recipe
+(`value = offset + scale * normalized`) fit over all cases' rows and applied to
 every case, so they share a scale. The scheme is swappable (see `NORMALIZERS` in
-`processor.py`); the default maps each column to `[-1, 1]`.
+`processor.py`); the default (`minmax_01`) maps each column to `[0, 1]`.
 
 The two data categories in the `source` column are:
 
@@ -55,22 +58,31 @@ Cases are split **by whole case** (seeded, reproducible) into `train/` and
 
 ## Pipeline
 
+Two phases with a **mergeable-stats seam** between them, so the expensive
+per-case work is independent and resumable:
+
 ```
-NetCDF sources ─▶ reader ─▶ (derive) ─▶ sync ─▶ normalize ─▶ writer ─▶ <snapshot>.npy
-                                                                        + metadata.json
+phase 1 (per case): read files ─▶ (derive) ─▶ canonical ─▶ concat ─▶ raw <case>.npy
+                                                                    + <case>.stats.json
+consolidate:        merge every <case>.stats.json ─▶ one global min/max ─▶ recipe
+phase 2 (per case): re-read raw <case>.npy ─▶ normalize ─▶ writer ─▶ <case>.npy
+                                                                    + metadata.json
 ```
 
 | Stage | File | Job |
 |-------|------|-----|
-| **Reader** | `reader.py` | Stream any NetCDF in chunks (memory-safe); map raw variables to canonical columns by dimension name. |
-| **Processor** | `processor.py` | Run a source's `derive` hook (computed columns), assemble canonical rows, then normalize. |
-| **Sync** | `sync.py` | Build one snapshot per HRRR time (its time + x/y bbox); attach LES/sensor rows by time window + bbox; drop the rest. |
-| **Writer** | `writer.py` | Split cases into `train/` and `test/`, write each `.npy` + a shared `metadata.json`. |
-| **Orchestrator** | `orchestrator.py` | Thin wiring of the above + CLI. |
+| **Reader** | `reader.py` | `discover_cases` (one Case per subfolder); stream any NetCDF in chunks (memory-safe); map raw variables to canonical columns by dimension name. |
+| **Processor** | `processor.py` | Run a source's `derive` hook (computed columns), assemble canonical rows; streaming per-column min/max; affine normalize. |
+| **Sync** | `sync.py` | Read an HRRR file's snapshot time to tag its case (no grouping). |
+| **Writer** | `writer.py` | Per-case stats sidecar + `consolidate_stats`; split cases into `train/`/`test/`; write each `.npy` + a shared `metadata.json`. |
+| **Orchestrator** | `orchestrator.py` | Wire the two phases + consolidation + CLI. |
+| **Device** | `device.py` | One place that swaps the array backend: numpy on CPU, torch on GPU. Only the swap points live here (no abstraction layer). |
 | **Registry** | `config.py` | The canonical schema and the instrument-type records that drive everything. |
 
 The stages are generic. **Source differences live in the registry as data, not
-in code.**
+in code.** The same generic property holds for the compute backend: every stage's
+array math is written once and runs on numpy or torch depending on `--device`, so
+CPU and GPU share one code path (see **GPU compute** below).
 
 ## Adding a new instrument
 
@@ -83,7 +95,7 @@ A record declares how a source's files map onto the canonical schema:
 SourceType(
     name="my instrument",       # human name (logs / metadata)
     match="myinst",             # filename substring; discovery matches by this
-    is_anchor=False,            # True only for HRRR (defines the snapshots)
+    is_anchor=False,            # True only for HRRR (tags the case time)
     column_map={                # direct canonical -> raw-variable renames
         "x": "lon", "y": "lat", "z": "alt",
         "u": "wind_u", "v": "wind_v",
@@ -104,35 +116,86 @@ Any optional column a source omits is left `NaN`, so partial sources are fine
 (e.g. housekeeping) is registered with `canonical=False`: recognized, but
 contributes no rows.
 
-Discovery matches files to records by **filename** (ARM datastream naming), so
-layout is free and one folder may hold mixed types. Files matching no record are
-reported and skipped.
+Within a case folder, files are matched to records by **filename** (ARM
+datastream naming) only to pick the reader for each file, not to group them.
+Files matching no record are reported and skipped.
 
 ## Usage
 
 ```bash
-# point at a folder tree of NetCDF files; get split cases + metadata
+# point at a folder of case subfolders; get split cases + metadata
 python orchestrator.py <input_root> <out_dir> \
-    [--chunk-size N] [--test-fraction F] [--seed S] [-v | -vv]
+    [--chunk-size N] [--test-fraction F] [--seed S] [--device cpu|cuda] [-v | -vv]
 ```
 
-`<input_root>` is any folder tree of `.nc` / `.cdf` files. Logging is silent by
-default; `-v` shows the sync summary, `-vv` per-block detail. Output:
+`<input_root>` holds one subfolder per case, each with one HRRR file plus its
+LES/sensor `.nc` / `.cdf` files:
+
+```
+<input_root>/
+    <case_a>/  hrrr.nc  wrfout_d01.nc  sgpecorsfwind...nc  ...
+    <case_b>/  hrrr.nc  wrfout_d01.nc  ...
+```
+
+Logging is silent by default; `-v` shows per-case row counts, `-vv` per-block
+detail. Output (case files named by folder):
 
 ```
 <out_dir>/
-    metadata.json          # schema, normalization recipe, split, case def
-    train/  hrrr_t<epoch>.npy ...
-    test/   hrrr_t<epoch>.npy ...
+    metadata.json          # schema, normalization recipe, split, per-case HRRR time
+    train/  <case_a>.npy ...
+    test/   <case_b>.npy ...
 ```
+
+## GPU compute
+
+The array math (destagger, broadcast, canonical assembly, min/max stats,
+normalize) is the same code on CPU and GPU; `--device` picks the backend.
+`device.py` holds the only backend-aware lines — everything else takes an array
+module (`xp`, numpy or torch) and does not know or care which it got. This is the
+same "differences are data, not code" principle the source registry follows,
+applied to the compute backend.
+
+Cases are **independent**: each is read and assembled on its own, so the
+parallelism is at the case level and peak memory is one case's rows regardless of
+backend. `--device` only chooses where a case's block math runs.
+
+**CPU (`--device cpu`, default).** numpy throughout; no GPU needed. Use on a
+workstation or when a dataset is far larger than device memory.
+
+**GPU (`--device cuda`).** Phase 1 runs a case's read/assemble/min-max on the
+GPU; the raw case is copied to host once and spilled as a raw `.npy`. Phase 2
+re-reads the raw `.npy`, normalizes it **on the GPU** (offset/scale resident),
+and copies it back once to write. The global min/max needed before any normalize
+comes from merging the tiny per-case stats sidecars, so there is no all-cases
+resident batch to size.
+
+**Where the per-case time goes.** The normalize step is elementwise math over a
+whole case; on the CPU it cost ~1.4 s/case. Running it **on the GPU before the
+device→host copy** drops it to ~0.007 s/case — effectively free. What remains is
+I/O: the netCDF read, the device↔host copies, and the `.npy` read/write. Those
+stay on the CPU by design and are shared by both paths — the GPU does not help
+with I/O.
+
+> **On benchmarking honestly:** the CPU reference (pre-process ~17.7 s/case,
+> measured on **MCC** over 600 LASSO cases) and the GPU runs (**ECC** H100) use
+> the **same-size data** — the ECC cases are full 1.2 GB, 144×144×226 wrfout files
+> (6 snapshots each), identical in grid and `.npy` size to the real LASSO
+> snapshots. The remaining difference is **hardware** (MCC vs ECC), so treat any
+> ratio as indicative, not exact; a fully clean figure needs both paths on the
+> same machine. What is firmly established: the normalize compute cost is
+> eliminated, and both stages are otherwise I/O-bound.
+
+> The GPU path is backend-generic: it operates on the canonical schema, never on
+> a source identity, so it applies equally to FastEddy, ARM sensors, or LASSO.
 
 ### Standalone LES (no HRRR)
 
-To process a single LES case (e.g. FastEddy) without a real HRRR inlet, add a
-**dummy anchor**: a minimal HRRR-named `.nc` with a `valid_time` matching the LES
-time and `longitude`/`latitude` spanning the LES x/y extent. HRRR contributes no
-rows, so the dummy only defines the case window; the LES rows are the data. Use
-`--test-fraction 0` when there is just one case.
+A case folder does not strictly need an HRRR file — without one the case simply
+carries no `hrrr_time` tag in metadata. If you want the snapshot time recorded
+(e.g. for a FastEddy case), drop in a minimal HRRR-named `.nc` with a matching
+`valid_time`; it contributes no rows either way. Use `--test-fraction 0` when
+there is just one case.
 
 ## Testing
 
@@ -140,14 +203,15 @@ rows, so the dummy only defines the case window; the LES rows are the data. Use
 pytest        # from this directory
 ```
 
-`fixtures/generate_phony_data.py` writes real-format phony NetCDFs for every
-instrument type, including deliberate off-time and off-location rows.
-`tests/test_end_to_end.py` runs the whole pipeline and asserts: cases split into
-`train/`+`test/` with metadata; every output row is inside the time window and
-bbox; off-location/off-time rows are excluded; every type is discovered by
-filename; derive hooks are correct; LASSO supplies `theta`/`p_prime` while
-sensors keep rows with `NaN`; `canonical=False` types contribute no rows;
-normalization is global.
+`fixtures/generate_phony_data.py` writes a folder-per-case tree: each case folder
+holds real-format phony NetCDFs for every instrument type plus an HRRR tag.
+`tests/test_end_to_end.py` runs the whole pipeline and asserts: case ids come
+from folder names; every file in a folder contributes; duplicate folder ids
+error; the per-case stats consolidate to a correct global recipe; cases split
+into `train/`+`test/` with the recipe and per-case HRRR time in metadata; every
+type is discovered by filename; derive hooks are correct; LASSO supplies
+`theta`/`p_prime` while sensors keep rows with `NaN`; `canonical=False` types
+contribute no rows; output is normalized (training-ready).
 
 ## Requirements
 
@@ -156,11 +220,12 @@ Python with `numpy` and `netCDF4`.
 ## Known limitations / next steps
 
 - **Coordinate reconciliation is not done.** Sources sit in different frames
-  (HRRR/sensor degrees, LES metres); spatial matching assumes a shared frame,
-  true on the phony data but not yet on the real files.
-- **HRRR `theta`/`p'`** are not derived (HRRR stores actual `T`/pressure, not the
-  WRF-style perturbations); left `NaN`, since deriving them needs a reference
-  state.
-- **Normalization** defaults to affine min-max into `[-1, 1]`; add or select
-  another scheme in `NORMALIZERS` (`processor.py`).
-- **Parallel reads** are designed for (chunks are independent) but not built.
+  (HRRR/sensor degrees, LES metres); the tool concatenates a folder's rows as-is,
+  so a consumer that needs a shared frame must reconcile them.
+- **HRRR `theta`/`p'`** are moot for rows (HRRR contributes none); it only tags
+  the case time.
+- **Normalization** defaults to affine min-max into `[0, 1]` (`minmax_01`); add or
+  select another scheme in `NORMALIZERS` (`processor.py`).
+- **GPU compute** runs the array math on `--device cuda` (see **GPU compute**);
+  reads and writes stay on the CPU (I/O-bound). Cutting the case dtype to
+  float32 would roughly halve the remaining host-copy + write cost — not yet done.

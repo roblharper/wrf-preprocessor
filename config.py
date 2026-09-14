@@ -25,10 +25,6 @@ REQUIRED_COLUMNS: tuple[str, ...] = ("x", "y", "z", "t")
 CANONICAL_COLUMNS: tuple[str, ...] = PHYSICAL_COLUMNS + ("source",)
 COLUMN_INDEX: dict[str, int] = {name: i for i, name in enumerate(CANONICAL_COLUMNS)}
 
-#: Half-width of the time-match window: rows within +/- this of a snapshot time
-#: are synced to it. Sensors are high-rate, so an exact match is too strict.
-TIME_TOLERANCE_SECONDS = 4350.0   # +/- 30 min (half of hourly HRRR cadence)
-
 # --- derive hooks: compute canonical columns that are not plain renames -------
 Raw = dict[str, np.ndarray]
 
@@ -61,8 +57,8 @@ def _smos(raw: Raw, xp=np) -> Raw:
 
 
 # Source category codes written to the 'source' column, so the loss can weight
-# simulation vs sensor. HRRR is NOT a data source: each .npy IS an HRRR snapshot
-# condition, so HRRR only anchors the case (time + bbox) and contributes no rows.
+# simulation vs sensor. HRRR is NOT a data source: each case IS an HRRR snapshot
+# condition, so HRRR only tags the case (records its time) and contributes no rows.
 SRC_SIM = 0         # LES (LASSO)
 SRC_SENSOR = 1      # all ground-observation streams
 
@@ -79,7 +75,7 @@ class SourceType:
     name: str
     match: str                          # filename substring identifying the type
     source_code: int = -1               # per-row tag written to the 'source' column
-    is_anchor: bool = False             # True only for HRRR (defines the snapshots)
+    is_anchor: bool = False             # True only for HRRR (tags the case time)
     column_map: dict[str, str] = field(default_factory=dict)
     derive: Callable[[Raw], Raw] | None = None
     derive_inputs: tuple[str, ...] = ()
@@ -95,7 +91,7 @@ REGISTRY: tuple[SourceType, ...] = (
     SourceType(
         name="HRRR forecast tile", match="hrrr", is_anchor=True,
         column_map={"x": "longitude", "y": "latitude", "t": "valid_time"},
-        note="anchor only: defines each snapshot's time + x/y bbox, not a data source",
+        note="tags the case with its snapshot time; contributes no rows",
     ),
     SourceType(
         name="LASSO WRF-LES", match="wrfout", source_code=SRC_SIM,

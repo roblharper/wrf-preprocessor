@@ -1,4 +1,4 @@
-"""End-to-end test: phony data in, synced per-snapshot .npy out."""
+"""End-to-end test: folder-per-case phony data in, normalized per-case .npy out."""
 
 from __future__ import annotations
 
@@ -14,10 +14,10 @@ _PKG = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_PKG))
 sys.path.insert(0, str(_PKG / "fixtures"))
 
-from config import COLUMN_INDEX, TIME_TOLERANCE_SECONDS
-from reader import discover_files, read_file
-from processor import to_canonical, anchor_points
-from sync import build_snapshots, attach_data
+from config import COLUMN_INDEX
+from reader import discover_cases, read_file
+from processor import to_canonical
+from writer import consolidate_stats, write_case_stats
 import orchestrator
 import generate_phony_data as gen
 
@@ -33,101 +33,125 @@ def phony(tmp_path):
     return root, manifest
 
 
-def _raw_snapshots(root: Path):
-    """Re-run read -> canonical -> sync on raw (un-normalized) rows."""
-
-    anchor, data = [], []
-    for path, src in discover_files(root):
-        for ch in read_file(path, src, chunk_size=50):
-            if src.is_anchor:
-                pts = anchor_points(ch, src)
-                if pts.size:
-                    anchor.append(pts)
-            else:
-                b = to_canonical(ch, src)
-                if b.size:
-                    data.append(b)
-    snaps = build_snapshots(anchor)
-    kept, dropped = attach_data(snaps, data)
-    return snaps, kept, dropped
+# --- folder-per-case discovery -----------------------------------------------
+def test_case_ids_come_from_folder_names(phony):
+    root, manifest = phony
+    cases = discover_cases(root)
+    assert sorted(c.name for c in cases) == manifest["case_ids"]
 
 
+def test_every_data_file_in_a_folder_is_kept(phony):
+    """Every recognized non-HRRR file in a folder is a data file (no filtering)."""
+    root, manifest = phony
+    cases = {c.name: c for c in discover_cases(root)}
+    for c in cases.values():
+        matches = {src.match for _, src in c.data_files}
+        for t in manifest["data_types"]:
+            assert t in matches, f"{c.name}: {t} not discovered as data"
+        assert c.hrrr is not None and c.hrrr[1].match == "hrrr"
+
+
+def test_duplicate_case_id_errors():
+    from reader import Case
+    from config import match_source
+    src = match_source("wrfout_d01.nc")
+    dup = [Case("x", None, [(Path("a"), src)]), Case("x", None, [(Path("b"), src)])]
+    with pytest.raises(ValueError, match="Duplicate case id"):
+        orchestrator._dedupe_check(dup)
+
+
+def test_folder_with_no_data_files_is_skipped(phony, tmp_path, caplog):
+    root, _ = phony
+    (root / "empty_case").mkdir()
+    cases = discover_cases(root)
+    assert "empty_case" not in {c.name for c in cases}
+
+
+# --- pipeline output ----------------------------------------------------------
 def test_pipeline_writes_split_cases(phony, tmp_path):
     root, manifest = phony
     out = tmp_path / "out"
     written = orchestrator.run(root, out, chunk_size=50)
 
-    # two snapshots, split into train/ and test/ dirs + a shared metadata.json
     all_stems = {p.stem for p in written["train"] + written["test"]}
-    assert all_stems == {f"hrrr_t{int(manifest['sync_time'])}",
-                         f"hrrr_t{int(manifest['off_time'])}"}
+    assert all_stems == set(manifest["case_ids"])
     assert (out / "metadata.json").exists()
     assert len(written["test"]) >= 1  # at least one held out
-    # splits are disjoint
     assert not ({p.stem for p in written["train"]} & {p.stem for p in written["test"]})
 
 
-def test_every_row_is_time_and_space_synced(phony):
+def test_hrrr_time_recorded_per_case(phony, tmp_path):
+    root, manifest = phony
+    out = tmp_path / "out"
+    orchestrator.run(root, out, chunk_size=50)
+
+    meta = json.loads((out / "metadata.json").read_text())
+    recorded = {}
+    for group in meta["cases"].values():
+        for cid, info in group.items():
+            recorded[cid] = info["hrrr_time"]
+    for cid, t in manifest["hrrr_times"].items():
+        assert recorded[cid] == pytest.approx(t)
+
+
+def test_stats_consolidate_to_a_correct_global_recipe(phony, tmp_path):
+    """The merged min/max equals a direct min/max over every case's raw rows."""
     root, _ = phony
-    snaps, kept, dropped = _raw_snapshots(root)
+    work = tmp_path / "work"; work.mkdir()
 
-    assert dropped > 0, "expected some off-time/off-location rows to be dropped"
-    for cid, snap in snaps.items():
-        r = snap.rows()
-        dt = np.abs(r[:, _T] - snap.time)
-        assert (dt <= TIME_TOLERANCE_SECONDS).all(), f"{cid}: a row is outside the time window"
-        x_min, x_max, y_min, y_max = snap.bbox
-        assert ((r[:, _X] >= x_min) & (r[:, _X] <= x_max)).all(), f"{cid}: a row is outside bbox x"
-        assert ((r[:, _Y] >= y_min) & (r[:, _Y] <= y_max)).all(), f"{cid}: a row is outside bbox y"
+    from config import CANONICAL_COLUMNS
+    from processor import RunningMinMax
+    ids, all_rows = [], []
+    for case in discover_cases(root):
+        stats = RunningMinMax(len(CANONICAL_COLUMNS))
+        blocks = []
+        for path, src in case.data_files:
+            for ch in read_file(path, src, chunk_size=50):
+                b = to_canonical(ch, src)
+                if b.size:
+                    stats.update(b); blocks.append(b)
+        rows = np.vstack(blocks)
+        np.save(work / f"{case.name}.npy", rows)
+        write_case_stats(work, case.name, *stats.result())
+        ids.append(case.name); all_rows.append(rows)
 
-
-def test_off_location_station_is_excluded(phony):
-    root, manifest = phony
-    snaps, _, _ = _raw_snapshots(root)
-
-    # the far station is at lon ~ (region_center + 5 deg); it must not survive.
-    far_lon_min = np.mean(manifest["region_lon"]) + 4.0
-    for cid, snap in snaps.items():
-        r = snap.rows()
-        assert (r[:, _X] < far_lon_min).all(), f"{cid}: off-location rows leaked in"
-
-
-def test_off_time_snapshot_has_no_sync_time_data(phony):
-    root, manifest = phony
-    snaps, _, _ = _raw_snapshots(root)
-
-    off_id = f"hrrr_t{int(manifest['off_time'])}"
-    r = snaps[off_id].rows()
-    # nothing in the off-time snapshot should carry the sync-time stamp
-    assert (np.abs(r[:, _T] - manifest["sync_time"]) > TIME_TOLERANCE_SECONDS).all()
+    gmin, gmax = consolidate_stats(work, ids)
+    stacked = np.vstack(all_rows)
+    ref_min = np.nanmin(np.where(np.isnan(stacked), np.inf, stacked), axis=0)
+    ref_max = np.nanmax(np.where(np.isnan(stacked), -np.inf, stacked), axis=0)
+    finite = np.isfinite(ref_min)
+    assert np.allclose(gmin[finite], ref_min[finite])
+    assert np.allclose(gmax[finite], ref_max[finite])
 
 
-def test_normalization_is_global(phony, tmp_path):
+def test_output_is_normalized_with_recipe_in_metadata(phony, tmp_path):
     root, _ = phony
     out = tmp_path / "out"
     orchestrator.run(root, out, chunk_size=50)
 
     meta = json.loads((out / "metadata.json").read_text())
-    # one global affine recipe: offset + scale per canonical column
     norm = meta["normalization"]
     offset, scale = norm["offset"], norm["scale"]
     assert len(scale) == len(COLUMN_INDEX) and len(offset) == len(COLUMN_INDEX)
-    assert norm["method"] == "minmax_pm1"
+    assert norm["method"] == "minmax_01"
 
-    # physical columns are within [-1, 1]; the source tag is left unscaled.
+    # minmax_01 maps physical columns into [0, 1]; the source tag is left unscaled.
     phys = [i for c, i in COLUMN_INDEX.items() if c != "source"]
     for f in out.rglob("*.npy"):
         d = np.load(f)[:, phys]
         finite = d[np.isfinite(d)]
-        assert np.all(np.abs(finite) <= 1.0 + 1e-9), f"{f.stem}: values exceed [-1, 1]"
+        assert np.all(finite >= -1e-9) and np.all(finite <= 1.0 + 1e-9), \
+            f"{f.stem}: values outside [0, 1]"
 
 
 # --- multi-type registry: discovery, derive hooks, unmapped types ------------
 def test_discovery_matches_multiple_instrument_types(phony):
-    """Every structural type is discovered by filename, across a mixed folder."""
-
+    """Every structural type is discovered by filename within a case folder."""
     root, _ = phony
-    matched = {src.match for _, src in discover_files(root)}
+    cases = discover_cases(root)
+    matched = {c.hrrr[1].match for c in cases if c.hrrr}
+    for _, src in [f for c in cases for f in c.data_files]:
+        matched.add(src.match)
     for expected in ("hrrr", "wrfout", "ecorsfwind", "smos", "twr", "co2flx",
                      "armbeatm", "dlaux"):
         assert expected in matched, f"{expected} not discovered"
@@ -135,13 +159,12 @@ def test_discovery_matches_multiple_instrument_types(phony):
 
 def test_derive_hooks_produce_correct_canonical_values(phony):
     """ARM time (base+offset) and smos speed/direction -> u, v."""
-
     root, _ = phony
-    obs = root / "obs"
+    case = root / "case_morning"
 
     def first_canonical(match_glob):
         from config import match_source
-        p = next((obs).glob(match_glob))
+        p = next(case.glob(match_glob))
         src = match_source(p.name)
         for ch in read_file(p, src, chunk_size=50):
             b = to_canonical(ch, src)
@@ -150,13 +173,12 @@ def test_derive_hooks_produce_correct_canonical_values(phony):
         return None
 
     # ecor has coordinates, so it survives the NaN-row drop; check absolute time.
-    ecor = first_canonical("ecorsfwind_a*")
+    ecor = first_canonical("*ecorsfwind*")
     assert ecor[0, _T] > 1_000_000_000, "ecor t is not an absolute epoch time"
 
     # smos has no lat/lon (dropped downstream), so test its wind derivation at
     # the hook level: wspd=5, wdir=270 (from the west) -> u ~ +5, v ~ 0.
     from config import _uv_from_speed_dir
-    import numpy as np
     out = _uv_from_speed_dir({"wspd": np.array([5.0]), "wdir": np.array([270.0])})
     assert abs(out["u"][0] - 5.0) < 0.5 and abs(out["v"][0]) < 0.5
 
@@ -164,9 +186,8 @@ def test_derive_hooks_produce_correct_canonical_values(phony):
 def test_source_tag_written_per_category(phony, tmp_path):
     """Each output row carries its source category code (sim/sensor).
 
-    HRRR is the anchor condition, not a data source, so no inlet rows appear.
+    HRRR is the case tag, not a data source, so no HRRR rows appear.
     """
-
     from config import SRC_SIM, SRC_SENSOR
     root, _ = phony
     out = tmp_path / "out"
@@ -181,7 +202,6 @@ def test_source_tag_written_per_category(phony, tmp_path):
 
 def test_optional_columns_nan_do_not_drop_rows(phony, tmp_path):
     """Sources lacking theta/p' keep their rows (NaN); LASSO supplies theta/p'."""
-
     from config import SRC_SIM, SRC_SENSOR
     root, _ = phony
     out = tmp_path / "out"
@@ -193,34 +213,31 @@ def test_optional_columns_nan_do_not_drop_rows(phony, tmp_path):
 
     sim = rows[rows[:, src] == SRC_SIM]
     sensor = rows[rows[:, src] == SRC_SENSOR]
-    # LASSO (sim) supplies theta/p'; sensors keep rows but with NaN theta/p'
+    # normalization is affine, so finiteness is preserved: sim has theta/p',
+    # sensor rows carry NaN there.
     assert sim.size and np.isfinite(sim[:, [th, pp]]).all()
     assert sensor.size and np.isnan(sensor[:, [th, pp]]).all()
-    # required coords/time are never NaN in any kept row
     req = [COLUMN_INDEX[c] for c in ("x", "y", "z", "t")]
     assert np.isfinite(rows[:, req]).all()
 
 
 def test_train_test_split_is_written_and_reproducible(phony, tmp_path):
     """Cases split into train/ and test/ dirs; the seeded split is stable."""
-
     root, _ = phony
     a = orchestrator.run(root, tmp_path / "a", chunk_size=50, seed=0)
     b = orchestrator.run(root, tmp_path / "b", chunk_size=50, seed=0)
 
     assert (tmp_path / "a" / "train").is_dir() and (tmp_path / "a" / "test").is_dir()
     assert a["test"], "expected at least one held-out test case"
-    # same seed -> same partition
     assert {p.stem for p in a["train"]} == {p.stem for p in b["train"]}
     assert {p.stem for p in a["test"]} == {p.stem for p in b["test"]}
 
 
 def test_unmapped_type_contributes_no_rows(phony):
     """A canonical=False type (dlaux) is recognized but adds no canonical rows."""
-
     from config import match_source
     root, _ = phony
-    p = next((root / "obs").glob("dlaux_a*"))
+    p = next((root / "case_morning").glob("*dlaux*"))
     src = match_source(p.name)
     assert src is not None and src.canonical is False
     rows = [to_canonical(ch, src) for ch in read_file(p, src, chunk_size=50)]
@@ -233,10 +250,9 @@ def test_staggered_winds_collapse_to_mass_grid(phony):
     Regression for the 81 TiB outer-product bug: every column must flatten to the
     same mass-grid row count, and Times must parse to an absolute epoch.
     """
-
     from config import match_source
     root, _ = phony
-    p = next((root / "sim").glob("wrfout_a*"))
+    p = next((root / "case_morning").glob("wrfout_*"))
     src = match_source(p.name)
     chunk = next(read_file(p, src, chunk_size=50))
 

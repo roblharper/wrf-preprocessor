@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
 
@@ -19,32 +20,65 @@ log = logging.getLogger(__name__)
 Chunk = dict[str, np.ndarray]
 
 
-def discover_files(input_root: Path) -> list[tuple[Path, SourceType]]:
-    """Walk the tree, match each .nc/.cdf file to a SourceType by filename.
+@dataclass(frozen=True)
+class Case:
+    """One case = one input subfolder.
 
-    Any folder layout works. Unmatched files are reported and skipped.
+    ``name`` is the folder name (the case id). ``hrrr`` is the single HRRR file
+    that tags the case with its snapshot time. ``data_files`` are every other
+    recognized file in the folder; all contribute rows unconditionally.
+    """
+
+    name: str
+    hrrr: tuple[Path, SourceType] | None
+    data_files: list[tuple[Path, SourceType]]
+
+
+def discover_cases(input_root: Path) -> list[Case]:
+    """One Case per immediate subfolder of ``input_root``.
+
+    The folder name is the case id (must be unique). Files inside a folder are
+    matched to a SourceType by filename only to pick the reader, not to group:
+    every recognized non-HRRR file is a data file. Folders yielding no data files
+    are skipped with a warning.
     """
     if not input_root.is_dir():
         raise NotADirectoryError(f"Input root does not exist: {input_root}")
 
-    matched: list[tuple[Path, SourceType]] = []
-    unmatched: list[Path] = []
-    for p in sorted(input_root.rglob("*")):
-        if not (p.is_file() and p.suffix in (".nc", ".cdf")):
-            continue
-        source = match_source(p.name)
-        if source is not None:
-            matched.append((p, source))
-            log.debug("matched %s -> %s", p.name, source.name)
-        else:
-            unmatched.append(p)
+    cases: list[Case] = []
+    for folder in sorted(p for p in input_root.iterdir() if p.is_dir()):
+        anchor: tuple[Path, SourceType] | None = None
+        data: list[tuple[Path, SourceType]] = []
+        unmatched: list[Path] = []
+        for p in sorted(folder.rglob("*")):
+            if not (p.is_file() and p.suffix in (".nc", ".cdf")):
+                continue
+            src = match_source(p.name)
+            if src is None:
+                unmatched.append(p)
+            elif src.is_anchor:
+                if anchor is not None:
+                    raise ValueError(
+                        f"Case '{folder.name}': more than one HRRR file "
+                        f"({anchor[0].name}, {p.name}); a case has one snapshot.")
+                anchor = (p, src)
+            else:
+                data.append((p, src))
+                log.debug("case %s: %s -> %s", folder.name, p.name, src.name)
 
-    if unmatched:
-        names = ", ".join(sorted({u.name for u in unmatched})[:6])
-        log.info("%d file(s) matched no type, skipped: %s", len(unmatched), names)
-    if not matched:
-        raise FileNotFoundError(f"No recognized NetCDF files under {input_root}.")
-    return matched
+        if unmatched:
+            names = ", ".join(sorted({u.name for u in unmatched})[:6])
+            log.info("case %s: %d file(s) matched no type, skipped: %s",
+                     folder.name, len(unmatched), names)
+        if not data:
+            log.warning("case %s: no recognized data files, skipped", folder.name)
+            continue
+        cases.append(Case(folder.name, anchor, data))
+
+    if not cases:
+        raise FileNotFoundError(
+            f"No cases found under {input_root}; expected input_root/<case>/ folders.")
+    return cases
 
 
 def read_file(path: Path, source: SourceType, *, chunk_size: int = 1,
