@@ -12,6 +12,7 @@ independent and resumable:
 from __future__ import annotations
 
 import logging
+import sys
 import tempfile
 from pathlib import Path
 
@@ -29,6 +30,15 @@ log = logging.getLogger(__name__)
 NORM_METHOD = "minmax_01"
 
 
+def _meter(phase, done, total):
+    """Default progress: a one-line bar per phase on stderr, newline when full."""
+    width = 30
+    filled = width * done // max(total, 1)
+    bar = "#" * filled + "-" * (width - filled)
+    end = "\n" if done >= total else "\r"
+    print(f"\r{phase:5s} [{bar}] {done}/{total}", end=end, file=sys.stderr, flush=True)
+
+
 def run(
     input_root: Path, out_dir: Path, *, chunk_size: int = 1,
     test_fraction: float = 0.2, seed: int = 0, progress=None, work_dir=None,
@@ -41,8 +51,7 @@ def run(
     (torch); I/O (read raw .npy, write) stays on the host.
     """
     def _tick(phase, done, total):
-        if progress is not None:
-            progress(phase, done, total)
+        (progress or _meter)(phase, done, total)
 
     cases = discover_cases(input_root)
     _dedupe_check(cases)
