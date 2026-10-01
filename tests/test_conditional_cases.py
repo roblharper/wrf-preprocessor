@@ -27,6 +27,7 @@ def _make_raw(path: Path, seed: int) -> None:
         path,
         initial=rng.standard_normal((n_ic, nc + nv)).astype(np.float32) * 5,
         boundary=rng.standard_normal((nf, n_times, face_len, nv)).astype(np.float32) * 5,
+        boundary_coords=rng.standard_normal((nf, n_times, face_len, nc)).astype(np.float32) * 5,
         terrain=rng.standard_normal((n_terr, 3)).astype(np.float32),
         interior=rng.standard_normal((n_pts, nc)).astype(np.float32) * 5,
         targets=rng.standard_normal((n_pts, nv)).astype(np.float32) * 5,

@@ -37,7 +37,7 @@ COORD_NAMES: tuple[str, ...] = ("x", "y", "z", "t")
 FACE_NAMES: tuple[str, ...] = ("west", "east", "south", "north")
 
 RAW_MEMBERS: tuple[str, ...] = (
-    "initial", "boundary", "terrain", "interior", "targets", "times",
+    "initial", "boundary", "boundary_coords", "terrain", "interior", "targets", "times",
 )
 
 
@@ -91,7 +91,8 @@ def _scan_stats(raw_paths: list[Path]) -> _MinMax:
         stats.update_state(raw["initial"][:, n_coord:])
         stats.update_coord(raw["interior"])
         stats.update_state(raw["targets"])
-        stats.update_state(raw["boundary"])          # (faces, times, len, state)
+        stats.update_state(raw["boundary"])              # (faces, times, len, state)
+        stats.update_coord(raw["boundary_coords"])       # (faces, times, len, coord)
     return stats
 
 
@@ -136,10 +137,12 @@ def _normalize_case(raw: dict[str, np.ndarray], recipe: dict) -> dict[str, np.nd
     mask = np.isfinite(targets).astype(np.float32)
     targets = _apply(np.where(mask > 0.0, targets, s_off), s_off, s_scale)
     targets = np.where(mask > 0.0, targets, 0.0).astype(np.float32)
-    boundary = _apply(raw["boundary"], s_off, s_scale)
+    boundary = _apply(raw["boundary"], s_off, s_scale)              # state recipe
+    boundary_coords = _apply(raw["boundary_coords"], c_off, c_scale)  # coord recipe
 
     return {
-        "initial": initial, "boundary": boundary, "terrain": raw["terrain"],
+        "initial": initial, "boundary": boundary,
+        "boundary_coords": boundary_coords, "terrain": raw["terrain"],
         "interior": interior, "targets": targets, "target_mask": mask,
         "times": raw["times"],
     }
