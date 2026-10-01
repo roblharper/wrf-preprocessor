@@ -1,23 +1,7 @@
-"""Case generator for the conditional PINN.
+"""Normalize raw sub-domain .npz files into ConditionalCase blobs the PINN reads.
 
-Input: one raw ``.npz`` per sub-domain (un-normalized), written by a one-off
-extraction script, holding the members:
-    initial    (n_ic, n_coord + n_state)   phi: tau=0 interior, coords then state
-    boundary   (n_faces, n_times, face_len, n_state)   psi: open-face history
-    terrain    (n_terr, 3)                 surface (x, y, elevation), static
-    interior   (n_pts, n_coord)            query coordinates (tau > 0)
-    targets    (n_pts, n_state)            matched interior state
-    times      (n_times,)                  snapshot times of the window
-``target_mask`` is optional; if absent it is derived from finite targets.
-
-This module normalizes once, consistently, across all sub-domains and writes the
-final ``ConditionalCase`` blobs the pinn reads. It does NOT read netCDF: the faces
-and fields already exist on disk. Normalization uses one global min/max per state
-variable (and per coordinate), merged over every sub-domain, so the same recipe is
-applied wherever a variable appears (in phi, psi, and the interior targets).
-
-Design mirrors the flat pipeline's seams (two passes, normalize once) but on the
-structured members. Source agnostic: nothing here is FastEddy specific.
+Two passes: merge one global min/max recipe over all sub-domains, then normalize
+each. Reads .npz only (no netCDF); source agnostic.
 """
 
 from __future__ import annotations
@@ -151,12 +135,8 @@ def _normalize_case(raw: dict[str, np.ndarray], recipe: dict) -> dict[str, np.nd
 def generate(
     raw_dir: Path, out_dir: Path, *, test_fraction: float = 0.2, seed: int = 0,
 ) -> dict[str, list[Path]]:
-    """Generate normalized ConditionalCase blobs from raw sub-domain .npz files.
-
-    Pass 1 scans global stats; pass 2 normalizes and writes one .npz per case into
-    out_dir/train or out_dir/test, plus a shared metadata.json. Returns the written
-    paths. Peak memory is one sub-domain at a time.
-    """
+    """Write normalized cases into out_dir/{train,test} plus metadata.json; return
+    the written paths. One sub-domain in memory at a time."""
     raw_dir, out_dir = Path(raw_dir), Path(out_dir)
     raw_paths = sorted(raw_dir.glob("*.npz"))
     if not raw_paths:
