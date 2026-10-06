@@ -132,11 +132,31 @@ def _normalize_case(raw: dict[str, np.ndarray], recipe: dict) -> dict[str, np.nd
     }
 
 
+def _default_ks(k: int) -> dict[str, int]:
+    return {v: k for v in STATE_VARS}
+
+
+def _parse_ks(spec: str) -> dict[str, int]:
+    """'16' -> all vars 16; 'u=32,v=12,w=110,theta=56' -> per-variable."""
+    if "=" not in spec:
+        return _default_ks(int(spec))
+    ks = dict(_default_ks(16))
+    for item in spec.split(","):
+        var, val = item.split("=")
+        ks[var.strip()] = int(val)
+    return ks
+
+
 def generate(
     raw_dir: Path, out_dir: Path, *, test_fraction: float = 0.2, seed: int = 0,
+    ks_initial: dict[str, int] | None = None,
+    ks_boundary: dict[str, int] | None = None,
 ) -> dict[str, list[Path]]:
-    """Write normalized cases into out_dir/{train,test} plus metadata.json; return
-    the written paths. One sub-domain in memory at a time."""
+    """Write normalized, POD-encoded cases into out_dir/{train,test} plus
+    metadata.json and pod_modes.npz. Each case stores per-variable coeffs z (not
+    raw state) for initial and boundary; ks_* give the modes kept per variable."""
+    ks_initial = ks_initial or _default_ks(16)
+    ks_boundary = ks_boundary or _default_ks(16)
     raw_dir, out_dir = Path(raw_dir), Path(out_dir)
     raw_paths = sorted(raw_dir.glob("*.npz"))
     if not raw_paths:
@@ -152,16 +172,90 @@ def generate(
     for g in ("train", "test"):
         (out_dir / g).mkdir(parents=True, exist_ok=True)
 
+    # POD basis is built from the TRAINING cases only, so held-out reconstruction
+    # is a real test. Only the (small) state columns are stacked, not full cases.
+    train_members = [_normalize_case(_load_raw(raw_dir / f"{i}.npz"), recipe)
+                     for i in train_ids]
+    pod = _build_pod(train_members, ks_initial, ks_boundary)
+    log.info("POD modes/var: initial %s, boundary %s",
+             pod["initial"]["k"], pod["boundary"]["k"])
+
     written: dict[str, list[Path]] = {"train": [], "test": []}
     for p in raw_paths:
-        members = _normalize_case(_load_raw(p), recipe)
+        members = _encode_case(_normalize_case(_load_raw(p), recipe), pod)
         dest = out_dir / group[p.stem] / f"{p.stem}.npz"
         np.savez(dest, **members)
         written[group[p.stem]].append(dest)
         log.info("wrote case %s -> %s", p.stem, group[p.stem])
 
-    _write_metadata(out_dir, recipe, written, test_fraction, seed)
+    np.savez(out_dir / "pod_modes.npz", **_flatten_pod(pod))
+    _write_metadata(out_dir, recipe, written, test_fraction, seed, pod)
     return written
+
+
+def _flatten_pod(pod: dict) -> dict:
+    """Flatten the nested per-variable POD dict to arrays for npz: keys like
+    'initial_mean_u', 'initial_modes_u', plus 'initial_n_points'."""
+    flat = {}
+    for field in ("initial", "boundary"):
+        flat[f"{field}_n_points"] = np.int64(pod[field]["n_points"])
+        for var in STATE_VARS:
+            flat[f"{field}_mean_{var}"] = pod[field]["means"][var]
+            flat[f"{field}_modes_{var}"] = pod[field]["modes"][var]
+    return flat
+
+
+def _encode_case(members: dict, pod: dict) -> dict:
+    """Replace raw initial/boundary state with per-variable POD coeffs z; keep
+    coords. Interior, targets, terrain, times pass through unchanged."""
+    n_coord = len(COORD_NAMES)
+    out = dict(members)
+    out["initial_coords"] = members["initial"][:, :n_coord]
+    out["z_initial"] = _encode_field(members["initial"][:, n_coord:], pod["initial"])
+    bnd_state = members["boundary"].reshape(-1, len(STATE_VARS))
+    out["z_boundary"] = _encode_field(bnd_state, pod["boundary"])
+    del out["initial"], out["boundary"]          # raw state dropped
+    return out
+
+
+def _var_basis(column: list[np.ndarray], k: int) -> tuple[np.ndarray, np.ndarray]:
+    """POD basis for one variable's column across training cases. column: list of
+    (n_points,) vectors. Returns mean (n_points,) and modes V (n_points, k_eff)."""
+    X = np.stack(column, axis=1).astype(np.float64)       # (n_points, n_cases)
+    mean = X.mean(axis=1, keepdims=True)
+    U, _, _ = np.linalg.svd(X - mean, full_matrices=False)
+    k_eff = min(k, U.shape[1])
+    return mean.ravel().astype(np.float32), U[:, :k_eff].astype(np.float32)
+
+
+def _build_pod_field(fields: list[np.ndarray], ks: dict[str, int]) -> dict:
+    """Per-variable POD for one field. fields: list of (n_points, n_state). ks maps
+    each state var to its mode count. Returns per-var means, modes, and k_eff."""
+    out = {"means": {}, "modes": {}, "k": {}, "n_points": int(fields[0].shape[0])}
+    for j, var in enumerate(STATE_VARS):
+        col = [f[:, j] for f in fields]
+        mean, V = _var_basis(col, ks[var])
+        out["means"][var] = mean
+        out["modes"][var] = V
+        out["k"][var] = int(V.shape[1])
+    return out
+
+
+def _encode_field(field: np.ndarray, basis: dict) -> np.ndarray:
+    """z = concat over variables of V_var^T (col - mean_var). Returns flat (sum k,)."""
+    parts = []
+    for j, var in enumerate(STATE_VARS):
+        parts.append(basis["modes"][var].T @ (field[:, j] - basis["means"][var]))
+    return np.concatenate(parts).astype(np.float32)
+
+
+def _build_pod(train_members: list[dict], ks_initial: dict, ks_boundary: dict) -> dict:
+    """Per-variable global POD bases for the initial and boundary state fields."""
+    n_coord = len(COORD_NAMES)
+    init_fields = [m["initial"][:, n_coord:] for m in train_members]
+    bnd_fields = [m["boundary"].reshape(-1, len(STATE_VARS)) for m in train_members]
+    return {"initial": _build_pod_field(init_fields, ks_initial),
+            "boundary": _build_pod_field(bnd_fields, ks_boundary)}
 
 
 def _split(ids: list[str], test_fraction: float, seed: int) -> tuple[list[str], list[str]]:
@@ -172,16 +266,26 @@ def _split(ids: list[str], test_fraction: float, seed: int) -> tuple[list[str], 
 
 
 def _write_metadata(out_dir: Path, recipe: dict, written: dict,
-                    test_fraction: float, seed: int) -> None:
+                    test_fraction: float, seed: int, pod: dict) -> None:
     meta = {
         "schema": {
             "state_vars": list(STATE_VARS), "coord_names": list(COORD_NAMES),
             "face_names": list(FACE_NAMES),
-            "members": list(RAW_MEMBERS) + ["target_mask"],
+            "members": ["initial_coords", "z_initial", "z_boundary",
+                        "boundary_coords", "terrain", "interior", "targets",
+                        "target_mask", "times"],
             "case_definition": "one sub-domain = (spatial extent, time window)",
         },
         "split": {"test_fraction": test_fraction, "seed": seed},
         "normalization": recipe,
+        "pod": {
+            "modes_file": "pod_modes.npz",
+            "per_variable": True,
+            "k_initial": pod["initial"]["k"],
+            "k_boundary": pod["boundary"]["k"],
+            "initial_n_points": pod["initial"]["n_points"],
+            "boundary_n_points": pod["boundary"]["n_points"],
+        },
         "cases": {g: [p.stem for p in paths] for g, paths in written.items()},
     }
     (out_dir / "metadata.json").write_text(json.dumps(meta, indent=2))
@@ -195,6 +299,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("out_dir", type=Path, help="Output folder (train/ test/ + metadata.json).")
     ap.add_argument("--test-fraction", type=float, default=0.2)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--k-initial", default="16",
+                    help="POD modes for initial: one int for all, or per-var "
+                         "'u=32,v=12,w=110,theta=56'.")
+    ap.add_argument("--k-boundary", default="16",
+                    help="POD modes for boundary (same format as --k-initial).")
     ap.add_argument("-v", "--verbose", action="count", default=0)
     args = ap.parse_args(argv)
 
@@ -203,7 +312,9 @@ def main(argv: list[str] | None = None) -> int:
         format="%(levelname)s %(name)s: %(message)s",
     )
     written = generate(args.raw_dir, args.out_dir,
-                       test_fraction=args.test_fraction, seed=args.seed)
+                       test_fraction=args.test_fraction, seed=args.seed,
+                       ks_initial=_parse_ks(args.k_initial),
+                       ks_boundary=_parse_ks(args.k_boundary))
     print(f"Wrote {len(written['train'])} train + {len(written['test'])} test cases "
           f"+ metadata.json to {args.out_dir}")
     return 0
