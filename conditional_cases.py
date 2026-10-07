@@ -152,19 +152,21 @@ def generate(
     ks_initial: dict[str, int] | None = None,
     ks_boundary: dict[str, int] | None = None,
 ) -> dict[str, list[Path]]:
-    """Write normalized, POD-encoded cases into out_dir/{train,test} plus
-    metadata.json and pod_modes.npz. Each case stores per-variable coeffs z (not
-    raw state) for initial and boundary; ks_* give the modes kept per variable."""
-    ks_initial = ks_initial or _default_ks(16)
-    ks_boundary = ks_boundary or _default_ks(16)
+    """Write normalized, POD-encoded cases into out_dir/{train,test} + metadata.json.
+
+    POD is PER SUBDOMAIN (each case carries its own modes): boundary is a time-SVD
+    of each face's (n_times x face_space); initial is a spatial-SVD over z-levels.
+    ks_* give modes kept per variable. Each case stores, per field/var, its modes,
+    mean, and coeffs; the raw state is dropped."""
+    ks_initial = ks_initial or _default_ks(4)
+    ks_boundary = ks_boundary or _default_ks(4)
     raw_dir, out_dir = Path(raw_dir), Path(out_dir)
     raw_paths = sorted(raw_dir.glob("*.npz"))
     if not raw_paths:
         raise FileNotFoundError(f"No raw sub-domain .npz files in {raw_dir}.")
     log.info("found %d raw sub-domains", len(raw_paths))
 
-    stats = _scan_stats(raw_paths)
-    recipe = _norm_recipe(stats)
+    recipe = _norm_recipe(_scan_stats(raw_paths))
 
     ids = [p.stem for p in raw_paths]
     train_ids, test_ids = _split(ids, test_fraction, seed)
@@ -172,90 +174,64 @@ def generate(
     for g in ("train", "test"):
         (out_dir / g).mkdir(parents=True, exist_ok=True)
 
-    # POD basis is built from the TRAINING cases only, so held-out reconstruction
-    # is a real test. Only the (small) state columns are stacked, not full cases.
-    train_members = [_normalize_case(_load_raw(raw_dir / f"{i}.npz"), recipe)
-                     for i in train_ids]
-    pod = _build_pod(train_members, ks_initial, ks_boundary)
-    log.info("POD modes/var: initial %s, boundary %s",
-             pod["initial"]["k"], pod["boundary"]["k"])
-
     written: dict[str, list[Path]] = {"train": [], "test": []}
     for p in raw_paths:
-        members = _encode_case(_normalize_case(_load_raw(p), recipe), pod)
+        members = _encode_case(_normalize_case(_load_raw(p), recipe),
+                               ks_initial, ks_boundary)
         dest = out_dir / group[p.stem] / f"{p.stem}.npz"
         np.savez(dest, **members)
         written[group[p.stem]].append(dest)
         log.info("wrote case %s -> %s", p.stem, group[p.stem])
 
-    np.savez(out_dir / "pod_modes.npz", **_flatten_pod(pod))
-    _write_metadata(out_dir, recipe, written, test_fraction, seed, pod)
+    _write_metadata(out_dir, recipe, written, test_fraction, seed,
+                    ks_initial, ks_boundary)
     return written
 
 
-def _flatten_pod(pod: dict) -> dict:
-    """Flatten the nested per-variable POD dict to arrays for npz: keys like
-    'initial_mean_u', 'initial_modes_u', plus 'initial_n_points'."""
-    flat = {}
-    for field in ("initial", "boundary"):
-        flat[f"{field}_n_points"] = np.int64(pod[field]["n_points"])
-        for var in STATE_VARS:
-            flat[f"{field}_mean_{var}"] = pod[field]["means"][var]
-            flat[f"{field}_modes_{var}"] = pod[field]["modes"][var]
-    return flat
+def _svd_encode(mat: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """POD of mat (n_samples x n_space) over its rows. Keep k modes. Returns
+    (mean (n_space,), modes (n_space x k), coeffs (n_samples x k)). Decode:
+    mean + coeffs @ modes.T."""
+    mean = mat.mean(axis=0, keepdims=True)
+    U, S, Vt = np.linalg.svd(mat - mean, full_matrices=False)
+    ke = min(k, Vt.shape[0])
+    modes = Vt[:ke].T                                   # (n_space, k)
+    coeffs = (U[:, :ke] * S[:ke])                       # (n_samples, k)
+    return (mean.ravel().astype(np.float32), modes.astype(np.float32),
+            coeffs.astype(np.float32))
 
 
-def _encode_case(members: dict, pod: dict) -> dict:
-    """Replace raw initial/boundary state with per-variable POD coeffs z; keep
-    coords. Interior, targets, terrain, times pass through unchanged."""
+def _encode_case(members: dict, ks_initial: dict, ks_boundary: dict) -> dict:
+    """Per-subdomain POD encode. Boundary: per face, time-SVD. Initial: spatial-SVD
+    over z-levels. Store modes/mean/coeffs per field/var; drop raw state."""
     n_coord = len(COORD_NAMES)
-    out = dict(members)
+    out = {k: members[k] for k in
+           ("boundary_coords", "terrain", "interior", "targets", "target_mask", "times")}
     out["initial_coords"] = members["initial"][:, :n_coord]
-    out["z_initial"] = _encode_field(members["initial"][:, n_coord:], pod["initial"])
-    bnd_state = members["boundary"].reshape(-1, len(STATE_VARS))
-    out["z_boundary"] = _encode_field(bnd_state, pod["boundary"])
-    del out["initial"], out["boundary"]          # raw state dropped
+
+    # --- boundary: (n_faces, n_times, face_len, n_state); time-SVD per face,var ---
+    bnd = members["boundary"]
+    nf, nt, fl, _ = bnd.shape
+    for vj, var in enumerate(STATE_VARS):
+        for face in range(nf):
+            mean, modes, coeffs = _svd_encode(bnd[face, :, :, vj], ks_boundary[var])
+            out[f"bnd_mean_{var}_{face}"] = mean
+            out[f"bnd_modes_{var}_{face}"] = modes
+            out[f"bnd_coeffs_{var}_{face}"] = coeffs
+
+    # --- initial: reshape to (nz, nx*ny), spatial-SVD over z-levels per var ---
+    init = members["initial"]
+    nx = len(np.unique(init[:, 0])); ny = len(np.unique(init[:, 1]))
+    nz = len(np.unique(init[:, 2]))
+    out["initial_grid"] = np.array([nx, ny, nz], dtype=np.int64)
+    state = init[:, n_coord:]
+    for vj, var in enumerate(STATE_VARS):
+        grid = state[:, vj].reshape(nx, ny, nz).transpose(2, 0, 1).reshape(nz, nx * ny)
+        mean, modes, coeffs = _svd_encode(grid, ks_initial[var])
+        out[f"ini_mean_{var}"] = mean
+        out[f"ini_modes_{var}"] = modes
+        out[f"ini_coeffs_{var}"] = coeffs
     return out
-
-
-def _var_basis(column: list[np.ndarray], k: int) -> tuple[np.ndarray, np.ndarray]:
-    """POD basis for one variable's column across training cases. column: list of
-    (n_points,) vectors. Returns mean (n_points,) and modes V (n_points, k_eff)."""
-    X = np.stack(column, axis=1).astype(np.float64)       # (n_points, n_cases)
-    mean = X.mean(axis=1, keepdims=True)
-    U, _, _ = np.linalg.svd(X - mean, full_matrices=False)
-    k_eff = min(k, U.shape[1])
-    return mean.ravel().astype(np.float32), U[:, :k_eff].astype(np.float32)
-
-
-def _build_pod_field(fields: list[np.ndarray], ks: dict[str, int]) -> dict:
-    """Per-variable POD for one field. fields: list of (n_points, n_state). ks maps
-    each state var to its mode count. Returns per-var means, modes, and k_eff."""
-    out = {"means": {}, "modes": {}, "k": {}, "n_points": int(fields[0].shape[0])}
-    for j, var in enumerate(STATE_VARS):
-        col = [f[:, j] for f in fields]
-        mean, V = _var_basis(col, ks[var])
-        out["means"][var] = mean
-        out["modes"][var] = V
-        out["k"][var] = int(V.shape[1])
-    return out
-
-
-def _encode_field(field: np.ndarray, basis: dict) -> np.ndarray:
-    """z = concat over variables of V_var^T (col - mean_var). Returns flat (sum k,)."""
-    parts = []
-    for j, var in enumerate(STATE_VARS):
-        parts.append(basis["modes"][var].T @ (field[:, j] - basis["means"][var]))
-    return np.concatenate(parts).astype(np.float32)
-
-
-def _build_pod(train_members: list[dict], ks_initial: dict, ks_boundary: dict) -> dict:
-    """Per-variable global POD bases for the initial and boundary state fields."""
-    n_coord = len(COORD_NAMES)
-    init_fields = [m["initial"][:, n_coord:] for m in train_members]
-    bnd_fields = [m["boundary"].reshape(-1, len(STATE_VARS)) for m in train_members]
-    return {"initial": _build_pod_field(init_fields, ks_initial),
-            "boundary": _build_pod_field(bnd_fields, ks_boundary)}
 
 
 def _split(ids: list[str], test_fraction: float, seed: int) -> tuple[list[str], list[str]]:
@@ -266,26 +242,20 @@ def _split(ids: list[str], test_fraction: float, seed: int) -> tuple[list[str], 
 
 
 def _write_metadata(out_dir: Path, recipe: dict, written: dict,
-                    test_fraction: float, seed: int, pod: dict) -> None:
+                    test_fraction: float, seed: int,
+                    ks_initial: dict, ks_boundary: dict) -> None:
     meta = {
         "schema": {
             "state_vars": list(STATE_VARS), "coord_names": list(COORD_NAMES),
             "face_names": list(FACE_NAMES),
-            "members": ["initial_coords", "z_initial", "z_boundary",
-                        "boundary_coords", "terrain", "interior", "targets",
-                        "target_mask", "times"],
             "case_definition": "one sub-domain = (spatial extent, time window)",
+            "pod": "per-subdomain; boundary time-SVD per face; initial spatial-SVD "
+                   "over z. Per field/var: {mean, modes, coeffs}; decode = "
+                   "mean + coeffs @ modes.T.",
         },
         "split": {"test_fraction": test_fraction, "seed": seed},
         "normalization": recipe,
-        "pod": {
-            "modes_file": "pod_modes.npz",
-            "per_variable": True,
-            "k_initial": pod["initial"]["k"],
-            "k_boundary": pod["boundary"]["k"],
-            "initial_n_points": pod["initial"]["n_points"],
-            "boundary_n_points": pod["boundary"]["n_points"],
-        },
+        "pod_modes": {"k_initial": ks_initial, "k_boundary": ks_boundary},
         "cases": {g: [p.stem for p in paths] for g, paths in written.items()},
     }
     (out_dir / "metadata.json").write_text(json.dumps(meta, indent=2))
