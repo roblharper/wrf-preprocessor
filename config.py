@@ -13,10 +13,10 @@ import numpy as np
 
 #: Physical columns read from the files, in order.
 PHYSICAL_COLUMNS: tuple[str, ...] = ("x", "y", "z", "t", "u", "v", "w",
-                                     "theta", "p_prime")
+                                     "theta", "p_prime", "q_v", "e_sgs")
 
 #: Columns a row MUST have. A row is dropped only if one of these is NaN (it has
-#: no usable position/time). Everything else (u,v,w,theta,p_prime) may be NaN for
+#: no usable position/time). Everything else (the state vars) may be NaN for
 #: a source that does not measure it; missing optional columns are logged, kept.
 REQUIRED_COLUMNS: tuple[str, ...] = ("x", "y", "z", "t")
 
@@ -115,6 +115,15 @@ REGISTRY: tuple[SourceType, ...] = (
         derive_inputs=("forecast_reference_time",), # 1 element tuple
         derive=_fasteddy_relative_time,
         note="standalone LES; local x/y/z in metres, theta/p' as perturbations",
+    ),
+    SourceType(
+        name="FastEddy coastal LES", match="FE_CSTL", source_code=SRC_SIM,
+        column_map={
+            "t": "time",
+            "u": "u", "v": "v", "w": "w", "theta": "theta",
+            "p_prime": "pressure", "q_v": "qv", "e_sgs": "TKE_0",
+        },
+        note="CA coastal LES; 7 state vars shipped straight through (no unit conversion)",
     ),
     SourceType(
         name="ecor sonic wind", match="ecorsfwind", source_code=SRC_SENSOR,

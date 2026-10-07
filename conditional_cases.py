@@ -15,8 +15,9 @@ import numpy as np
 
 log = logging.getLogger(__name__)
 
-#: Variable order carried in the state columns of every member.
-STATE_VARS: tuple[str, ...] = ("u", "v", "w", "theta")
+#: Variable order carried in the state columns of every member. Matches the
+#: builder's 7-var raw .npz (u,v,w,theta,pressure,qv,TKE_0 -> p_prime,q_v,e_sgs).
+STATE_VARS: tuple[str, ...] = ("u", "v", "w", "theta", "p_prime", "q_v", "e_sgs")
 COORD_NAMES: tuple[str, ...] = ("x", "y", "z", "t")
 FACE_NAMES: tuple[str, ...] = ("west", "east", "south", "north")
 

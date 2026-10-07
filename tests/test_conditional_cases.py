@@ -19,13 +19,23 @@ import conditional_cases as cc  # noqa: E402
 
 
 def _make_raw(path: Path, seed: int) -> None:
-    """Write one raw sub-domain .npz with known small shapes."""
+    """Write one raw sub-domain .npz with known small shapes.
+
+    ``initial`` must be a structured nx*ny*nz grid (the encoder reshapes it over
+    z-levels), so its coordinates are a real meshgrid, not random points.
+    """
     nv, nc, nf = len(cc.STATE_VARS), len(cc.COORD_NAMES), len(cc.FACE_NAMES)
-    n_ic, n_times, face_len, n_terr, n_pts = 5, 3, 4, 6, 7
+    ngrid = (3, 3, 4)                       # nx, ny, nz
+    n_ic = ngrid[0] * ngrid[1] * ngrid[2]
+    n_times, face_len, n_terr, n_pts = 3, 4, 6, 7
     rng = np.random.default_rng(seed)
+    gx, gy, gz = (a.reshape(-1) for a in np.meshgrid(
+        np.arange(ngrid[0]), np.arange(ngrid[1]), np.arange(ngrid[2]), indexing="ij"))
+    ini_coords = np.stack([gx, gy, gz, np.full(n_ic, seed)], 1).astype(np.float32)
+    ini_state = rng.standard_normal((n_ic, nv)).astype(np.float32) * 5
     np.savez(
         path,
-        initial=rng.standard_normal((n_ic, nc + nv)).astype(np.float32) * 5,
+        initial=np.concatenate([ini_coords, ini_state], axis=1),
         boundary=rng.standard_normal((nf, n_times, face_len, nv)).astype(np.float32) * 5,
         boundary_coords=rng.standard_normal((nf, n_times, face_len, nc)).astype(np.float32) * 5,
         terrain=rng.standard_normal((n_terr, 3)).astype(np.float32),
@@ -36,6 +46,7 @@ def _make_raw(path: Path, seed: int) -> None:
 
 
 def test_generate_normalizes_and_splits(tmp_path):
+    pytest.importorskip("wrf_pinn")
     raw = tmp_path / "raw"; raw.mkdir()
     for i in range(10):
         _make_raw(raw / f"sub_{i:02d}.npz", seed=i)
@@ -45,17 +56,19 @@ def test_generate_normalizes_and_splits(tmp_path):
 
     assert len(written["train"]) == 8 and len(written["test"]) == 2
 
-    # every normalized state value lands in [0, 1] (global minmax_01)
-    nc = len(cc.COORD_NAMES)
+    # Normalized targets land in [0, 1]; the POD-decoded initial/boundary fields
+    # reconstruct back into [0, 1] (coeffs/modes themselves are unbounded).
+    from wrf_pinn.data.conditional_case import decode_boundary, decode_initial
     for group in ("train", "test"):
         for p in written[group]:
             with np.load(p) as b:
-                for member, sl in (("initial", np.s_[:, nc:]),
-                                   ("targets", np.s_[:]),
-                                   ("boundary", np.s_[:])):
-                    vals = b[member][sl]
-                    vals = vals[np.isfinite(vals)]
-                    assert vals.min() >= -1e-5 and vals.max() <= 1 + 1e-5, member
+                tv = b["targets"]; tv = tv[np.isfinite(tv)]
+                assert tv.min() >= -1e-5 and tv.max() <= 1 + 1e-5, "targets"
+                for name, decoded in (("boundary", decode_boundary(b)),
+                                      ("initial", decode_initial(b))):
+                    for var, field in decoded.items():
+                        v = field[np.isfinite(field)]
+                        assert v.min() >= -1e-2 and v.max() <= 1 + 1e-2, f"{name}:{var}"
 
     meta = json.loads((out / "metadata.json").read_text())
     assert meta["normalization"]["method"] == "minmax_01"
@@ -74,6 +87,8 @@ def test_written_cases_load_in_pinn(tmp_path):
     written = cc.generate(raw, out, test_fraction=0.25, seed=0)
 
     case = read_conditional_case(written["train"][0])
-    assert case.boundary.shape[0] == len(cc.FACE_NAMES)
+    # decoded boundary is (n_state, n_faces, n_times, face_len)
+    assert case.boundary.shape[0] == len(cc.STATE_VARS)
+    assert case.boundary.shape[1] == len(cc.FACE_NAMES)
     assert case.targets.shape[1] == len(cc.STATE_VARS)
     assert np.isfinite(case.interior).all()
