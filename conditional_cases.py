@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -21,8 +22,12 @@ STATE_VARS: tuple[str, ...] = ("u", "v", "w", "theta", "p_prime", "q_v", "e_sgs"
 COORD_NAMES: tuple[str, ...] = ("x", "y", "z", "t")
 FACE_NAMES: tuple[str, ...] = ("west", "east", "south", "north")
 
+#: Bottom-face flux columns in the 'surface' member, after its x,y,t columns.
+FLUX_VARS: tuple[str, ...] = ("fricVel", "htFlux")
+
 RAW_MEMBERS: tuple[str, ...] = (
-    "initial", "boundary", "boundary_coords", "terrain", "interior", "targets", "times",
+    "initial", "boundary", "boundary_coords", "terrain", "interior", "targets",
+    "times", "surface",
 )
 
 
@@ -34,13 +39,16 @@ class _MinMax:
     state_max: np.ndarray
     coord_min: np.ndarray
     coord_max: np.ndarray
+    flux_min: np.ndarray
+    flux_max: np.ndarray
 
     @classmethod
     def empty(cls) -> "_MinMax":
-        ns, nc = len(STATE_VARS), len(COORD_NAMES)
+        ns, nc, nf = len(STATE_VARS), len(COORD_NAMES), len(FLUX_VARS)
         return cls(
             state_min=np.full(ns, np.nan), state_max=np.full(ns, np.nan),
             coord_min=np.full(nc, np.nan), coord_max=np.full(nc, np.nan),
+            flux_min=np.full(nf, np.nan), flux_max=np.full(nf, np.nan),
         )
 
     def update_state(self, arr: np.ndarray) -> None:
@@ -54,6 +62,11 @@ class _MinMax:
         self.coord_min = np.fmin(self.coord_min, np.nanmin(flat, axis=0))
         self.coord_max = np.fmax(self.coord_max, np.nanmax(flat, axis=0))
 
+    def update_flux(self, arr: np.ndarray) -> None:
+        flat = arr.reshape(-1, arr.shape[-1])
+        self.flux_min = np.fmin(self.flux_min, np.nanmin(flat, axis=0))
+        self.flux_max = np.fmax(self.flux_max, np.nanmax(flat, axis=0))
+
 
 def _load_raw(path: Path) -> dict[str, np.ndarray]:
     """Read one raw sub-domain .npz; validate members; derive target_mask."""
@@ -66,9 +79,11 @@ def _load_raw(path: Path) -> dict[str, np.ndarray]:
 
 
 def _scan_stats(raw_paths: list[Path]) -> _MinMax:
-    """Pass 1: merge global min/max over every sub-domain (never holds all at once)."""
+    """Pass 1: merge global min/max over every sub-domain (never holds all at once).
+    An all-NaN column (e.g. surface has no z) is expected and maps to identity."""
     stats = _MinMax.empty()
     n_coord, n_state = len(COORD_NAMES), len(STATE_VARS)
+    warnings.filterwarnings("ignore", r"All-NaN slice", RuntimeWarning)
     for p in raw_paths:
         raw = _load_raw(p)
         # initial = coords then state; interior = coords only; targets = state
@@ -78,7 +93,20 @@ def _scan_stats(raw_paths: list[Path]) -> _MinMax:
         stats.update_state(raw["targets"])
         stats.update_state(raw["boundary"])              # (faces, times, len, state)
         stats.update_coord(raw["boundary_coords"])       # (faces, times, len, coord)
+        stats.update_coord(_surface_coords(raw["surface"]))   # surface x,y,t
+        stats.update_flux(raw["surface"][..., 3:])            # fricVel, htFlux
     return stats
+
+
+def _surface_coords(surface: np.ndarray) -> np.ndarray:
+    """Lift the surface member's x,y,t columns into a (..., 4) coord array (z left
+    NaN, so it does not affect z stats) for the shared coord recipe."""
+    flat = surface.reshape(-1, surface.shape[-1])
+    coords = np.full((flat.shape[0], len(COORD_NAMES)), np.nan, dtype=np.float32)
+    coords[:, 0] = flat[:, 0]        # x
+    coords[:, 1] = flat[:, 1]        # y
+    coords[:, 3] = flat[:, 2]        # t
+    return coords
 
 
 def _norm_recipe(stats: _MinMax) -> dict:
@@ -92,11 +120,14 @@ def _norm_recipe(stats: _MinMax) -> dict:
 
     s_off, s_scale = recipe(stats.state_min, stats.state_max)
     c_off, c_scale = recipe(stats.coord_min, stats.coord_max)
+    f_off, f_scale = recipe(stats.flux_min, stats.flux_max)
     return {
         "method": "minmax_01",
         "state_vars": list(STATE_VARS), "coord_names": list(COORD_NAMES),
+        "flux_vars": list(FLUX_VARS),
         "state_offset": s_off, "state_scale": s_scale,
         "coord_offset": c_off, "coord_scale": c_scale,
+        "flux_offset": f_off, "flux_scale": f_scale,
     }
 
 
@@ -112,6 +143,8 @@ def _normalize_case(raw: dict[str, np.ndarray], recipe: dict) -> dict[str, np.nd
     s_scale = np.array(recipe["state_scale"], dtype=np.float32)
     c_off = np.array(recipe["coord_offset"], dtype=np.float32)
     c_scale = np.array(recipe["coord_scale"], dtype=np.float32)
+    f_off = np.array(recipe["flux_offset"], dtype=np.float32)
+    f_scale = np.array(recipe["flux_scale"], dtype=np.float32)
 
     initial = raw["initial"].copy()
     initial[:, :n_coord] = _apply(initial[:, :n_coord], c_off, c_scale)
@@ -125,11 +158,17 @@ def _normalize_case(raw: dict[str, np.ndarray], recipe: dict) -> dict[str, np.nd
     boundary = _apply(raw["boundary"], s_off, s_scale)              # state recipe
     boundary_coords = _apply(raw["boundary_coords"], c_off, c_scale)  # coord recipe
 
+    # surface: x,y,t by coord recipe (x,y,t live at coord indices 0,1,3); fluxes by flux recipe
+    surface = raw["surface"].copy()
+    xyt = c_off[[0, 1, 3]], c_scale[[0, 1, 3]]
+    surface[..., :3] = _apply(surface[..., :3], *xyt)
+    surface[..., 3:] = _apply(surface[..., 3:], f_off, f_scale)
+
     return {
         "initial": initial, "boundary": boundary,
         "boundary_coords": boundary_coords, "terrain": raw["terrain"],
         "interior": interior, "targets": targets, "target_mask": mask,
-        "times": raw["times"],
+        "times": raw["times"], "surface": surface,
     }
 
 
@@ -207,7 +246,8 @@ def _encode_case(members: dict, ks_initial: dict, ks_boundary: dict) -> dict:
     over z-levels. Store modes/mean/coeffs per field/var; drop raw state."""
     n_coord = len(COORD_NAMES)
     out = {k: members[k] for k in
-           ("boundary_coords", "terrain", "interior", "targets", "target_mask", "times")}
+           ("boundary_coords", "terrain", "interior", "targets", "target_mask",
+            "times", "surface")}
     out["initial_coords"] = members["initial"][:, :n_coord]
 
     # --- boundary: (n_faces, n_times, face_len, n_state); time-SVD per face,var ---
@@ -248,7 +288,8 @@ def _write_metadata(out_dir: Path, recipe: dict, written: dict,
     meta = {
         "schema": {
             "state_vars": list(STATE_VARS), "coord_names": list(COORD_NAMES),
-            "face_names": list(FACE_NAMES),
+            "face_names": list(FACE_NAMES), "flux_vars": list(FLUX_VARS),
+            "surface": "per-snapshot bottom face: columns x,y,t,fricVel,htFlux (normalized)",
             "case_definition": "one sub-domain = (spatial extent, time window)",
             "pod": "per-subdomain; boundary time-SVD per face; initial spatial-SVD "
                    "over z. Per field/var: {mean, modes, coeffs}; decode = "

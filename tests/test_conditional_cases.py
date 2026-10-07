@@ -33,6 +33,8 @@ def _make_raw(path: Path, seed: int) -> None:
         np.arange(ngrid[0]), np.arange(ngrid[1]), np.arange(ngrid[2]), indexing="ij"))
     ini_coords = np.stack([gx, gy, gz, np.full(n_ic, seed)], 1).astype(np.float32)
     ini_state = rng.standard_normal((n_ic, nv)).astype(np.float32) * 5
+    n_face_pts = 9
+    surface = rng.standard_normal((n_times, n_face_pts, 5)).astype(np.float32) * 5
     np.savez(
         path,
         initial=np.concatenate([ini_coords, ini_state], axis=1),
@@ -42,6 +44,7 @@ def _make_raw(path: Path, seed: int) -> None:
         interior=rng.standard_normal((n_pts, nc)).astype(np.float32) * 5,
         targets=rng.standard_normal((n_pts, nv)).astype(np.float32) * 5,
         times=np.arange(n_times, dtype=np.float32),
+        surface=surface,
     )
 
 
