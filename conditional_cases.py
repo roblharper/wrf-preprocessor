@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
@@ -84,7 +85,10 @@ def _scan_stats(raw_paths: list[Path]) -> _MinMax:
     stats = _MinMax.empty()
     n_coord, n_state = len(COORD_NAMES), len(STATE_VARS)
     warnings.filterwarnings("ignore", r"All-NaN slice", RuntimeWarning)
-    for p in raw_paths:
+    n = len(raw_paths)
+    t0 = time.time()
+    log.info("scan pass: reading %d sub-domains for global min/max", n)
+    for i, p in enumerate(raw_paths, 1):
         raw = _load_raw(p)
         # initial = coords then state; interior = coords only; targets = state
         stats.update_coord(raw["initial"][:, :n_coord])
@@ -95,6 +99,11 @@ def _scan_stats(raw_paths: list[Path]) -> _MinMax:
         stats.update_coord(raw["boundary_coords"])       # (faces, times, len, coord)
         stats.update_coord(_surface_coords(raw["surface"]))   # surface x,y,t
         stats.update_flux(raw["surface"][..., 3:])            # fricVel, htFlux
+        if i % 500 == 0 or i == n:
+            dt = time.time() - t0
+            log.info("scan %d/%d  %.0fs  %.1f cases/s  eta %.0fs",
+                     i, n, dt, i / dt, (n - i) / (i / dt))
+    log.info("scan pass done in %.0fs", time.time() - t0)
     return stats
 
 
@@ -215,13 +224,21 @@ def generate(
         (out_dir / g).mkdir(parents=True, exist_ok=True)
 
     written: dict[str, list[Path]] = {"train": [], "test": []}
-    for p in raw_paths:
+    n = len(raw_paths)
+    t0 = time.time()
+    log.info("encode pass: normalizing + POD-encoding %d cases "
+             "(%d train / %d test)", n, len(train_ids), len(test_ids))
+    for i, p in enumerate(raw_paths, 1):
         members = _encode_case(_normalize_case(_load_raw(p), recipe),
                                ks_initial, ks_boundary)
         dest = out_dir / group[p.stem] / f"{p.stem}.npz"
         np.savez(dest, **members)
         written[group[p.stem]].append(dest)
-        log.info("wrote case %s -> %s", p.stem, group[p.stem])
+        if i % 500 == 0 or i == n:
+            dt = time.time() - t0
+            log.info("encode %d/%d  %.0fs  %.1f cases/s  eta %.0fs",
+                     i, n, dt, i / dt, (n - i) / (i / dt))
+    log.info("encode pass done in %.0fs", time.time() - t0)
 
     _write_metadata(out_dir, recipe, written, test_fraction, seed,
                     ks_initial, ks_boundary)
