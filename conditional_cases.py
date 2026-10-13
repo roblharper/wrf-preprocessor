@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import multiprocessing
+import os
 import time
 import warnings
 from dataclasses import dataclass
@@ -252,6 +253,8 @@ def generate(
     group = {i: "train" for i in train_ids} | {i: "test" for i in test_ids}
     for g in ("train", "test"):
         (out_dir / g).mkdir(parents=True, exist_ok=True)
+        for stale in (out_dir / g).glob("*.tmp.npz"):   # half-written by a killed job
+            stale.unlink()
 
     # destinations fixed up front, in sorted order, so metadata matches serial
     jobs = [(p, out_dir / group[p.stem] / f"{p.stem}.npz") for p in raw_paths]
@@ -260,9 +263,10 @@ def generate(
         written[group[p.stem]].append(dest)
     n = len(raw_paths)
     t0 = time.time()
+    n_done = sum(dest.exists() for _, dest in jobs)
     log.info("encode pass: normalizing + POD-encoding %d cases "
-             "(%d train / %d test, %d workers)", n, len(train_ids), len(test_ids),
-             workers)
+             "(%d train / %d test, %d workers, %d already written)",
+             n, len(train_ids), len(test_ids), workers, n_done)
     encode = partial(_encode_file, recipe=recipe, ks_initial=ks_initial,
                      ks_boundary=ks_boundary)
     for i, _ in enumerate(_map(encode, jobs, workers), 1):
@@ -279,10 +283,16 @@ def generate(
 
 def _encode_file(job: tuple[Path, Path], recipe: dict, ks_initial: dict,
                  ks_boundary: dict) -> Path:
-    """Pass 2 for one case: normalize, POD-encode, write to its destination."""
+    """Pass 2 for one case: normalize, POD-encode, write to its destination.
+    Skips a case already written; writes via a temp name so a killed job never
+    leaves a half-written case."""
     src, dest = job
-    np.savez(dest, **_encode_case(_normalize_case(_load_raw(src), recipe),
-                                  ks_initial, ks_boundary))
+    if dest.exists():
+        return dest
+    tmp = dest.with_name(dest.stem + ".tmp.npz")
+    np.savez(tmp, **_encode_case(_normalize_case(_load_raw(src), recipe),
+                                 ks_initial, ks_boundary))
+    os.replace(tmp, dest)
     return dest
 
 
