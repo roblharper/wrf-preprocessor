@@ -1,16 +1,19 @@
 """Normalize raw sub-domain .npz files into ConditionalCase blobs the PINN reads.
 
 Two passes: merge one global min/max recipe over all sub-domains, then normalize
-each. Reads .npz only (no netCDF); source agnostic.
+each. Both passes are per-case, so they run over a process pool (--workers). Reads
+.npz only (no netCDF); source agnostic.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import multiprocessing
 import time
 import warnings
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 
 import numpy as np
@@ -68,6 +71,14 @@ class _MinMax:
         self.flux_min = np.fmin(self.flux_min, np.nanmin(flat, axis=0))
         self.flux_max = np.fmax(self.flux_max, np.nanmax(flat, axis=0))
 
+    def merge(self, other: "_MinMax") -> None:
+        """Fold another case's min/max in (order-independent, so exact in parallel)."""
+        for name in ("state", "coord", "flux"):
+            setattr(self, f"{name}_min", np.fmin(getattr(self, f"{name}_min"),
+                                                 getattr(other, f"{name}_min")))
+            setattr(self, f"{name}_max", np.fmax(getattr(self, f"{name}_max"),
+                                                 getattr(other, f"{name}_max")))
+
 
 def _load_raw(path: Path) -> dict[str, np.ndarray]:
     """Read one raw sub-domain .npz; validate members; derive target_mask."""
@@ -79,17 +90,23 @@ def _load_raw(path: Path) -> dict[str, np.ndarray]:
     return raw
 
 
-def _scan_stats(raw_paths: list[Path]) -> _MinMax:
-    """Pass 1: merge global min/max over every sub-domain (never holds all at once).
-    An all-NaN column (e.g. surface has no z) is expected and maps to identity."""
+def _map(fn, items: list, workers: int):
+    """Yield fn(item) for every item: in order when serial, as finished in a pool."""
+    if workers <= 1:
+        yield from map(fn, items)
+        return
+    with multiprocessing.Pool(workers) as pool:
+        yield from pool.imap_unordered(fn, items, chunksize=8)
+
+
+def _case_stats(path: Path) -> _MinMax:
+    """Min/max of one sub-domain. An all-NaN column (e.g. surface has no z) is
+    expected and maps to identity."""
+    n_coord = len(COORD_NAMES)
     stats = _MinMax.empty()
-    n_coord, n_state = len(COORD_NAMES), len(STATE_VARS)
-    warnings.filterwarnings("ignore", r"All-NaN slice", RuntimeWarning)
-    n = len(raw_paths)
-    t0 = time.time()
-    log.info("scan pass: reading %d sub-domains for global min/max", n)
-    for i, p in enumerate(raw_paths, 1):
-        raw = _load_raw(p)
+    raw = _load_raw(path)
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", r"All-NaN slice", RuntimeWarning)
         # initial = coords then state; interior = coords only; targets = state
         stats.update_coord(raw["initial"][:, :n_coord])
         stats.update_state(raw["initial"][:, n_coord:])
@@ -99,6 +116,18 @@ def _scan_stats(raw_paths: list[Path]) -> _MinMax:
         stats.update_coord(raw["boundary_coords"])       # (faces, times, len, coord)
         stats.update_coord(_surface_coords(raw["surface"]))   # surface x,y,t
         stats.update_flux(raw["surface"][..., 3:])            # fricVel, htFlux
+    return stats
+
+
+def _scan_stats(raw_paths: list[Path], workers: int = 1) -> _MinMax:
+    """Pass 1: merge global min/max over every sub-domain (never holds all at once)."""
+    stats = _MinMax.empty()
+    n = len(raw_paths)
+    t0 = time.time()
+    log.info("scan pass: reading %d sub-domains for global min/max (%d workers)",
+             n, workers)
+    for i, case in enumerate(_map(_case_stats, raw_paths, workers), 1):
+        stats.merge(case)
         if i % 500 == 0 or i == n:
             dt = time.time() - t0
             log.info("scan %d/%d  %.0fs  %.1f cases/s  eta %.0fs",
@@ -199,14 +228,15 @@ def _parse_ks(spec: str) -> dict[str, int]:
 def generate(
     raw_dir: Path, out_dir: Path, *, test_fraction: float = 0.2, seed: int = 0,
     ks_initial: dict[str, int] | None = None,
-    ks_boundary: dict[str, int] | None = None,
+    ks_boundary: dict[str, int] | None = None, workers: int = 1,
 ) -> dict[str, list[Path]]:
     """Write normalized, POD-encoded cases into out_dir/{train,test} + metadata.json.
 
     POD is PER SUBDOMAIN (each case carries its own modes): boundary is a time-SVD
     of each face's (n_times x face_space); initial is a spatial-SVD over z-levels.
     ks_* give modes kept per variable. Each case stores, per field/var, its modes,
-    mean, and coeffs; the raw state is dropped."""
+    mean, and coeffs; the raw state is dropped. workers > 1 runs both passes over
+    a process pool; the output is identical to serial."""
     ks_initial = ks_initial or _default_ks(4)
     ks_boundary = ks_boundary or _default_ks(4)
     raw_dir, out_dir = Path(raw_dir), Path(out_dir)
@@ -215,7 +245,7 @@ def generate(
         raise FileNotFoundError(f"No raw sub-domain .npz files in {raw_dir}.")
     log.info("found %d raw sub-domains", len(raw_paths))
 
-    recipe = _norm_recipe(_scan_stats(raw_paths))
+    recipe = _norm_recipe(_scan_stats(raw_paths, workers))
 
     ids = [p.stem for p in raw_paths]
     train_ids, test_ids = _split(ids, test_fraction, seed)
@@ -223,17 +253,19 @@ def generate(
     for g in ("train", "test"):
         (out_dir / g).mkdir(parents=True, exist_ok=True)
 
+    # destinations fixed up front, in sorted order, so metadata matches serial
+    jobs = [(p, out_dir / group[p.stem] / f"{p.stem}.npz") for p in raw_paths]
     written: dict[str, list[Path]] = {"train": [], "test": []}
+    for p, dest in jobs:
+        written[group[p.stem]].append(dest)
     n = len(raw_paths)
     t0 = time.time()
     log.info("encode pass: normalizing + POD-encoding %d cases "
-             "(%d train / %d test)", n, len(train_ids), len(test_ids))
-    for i, p in enumerate(raw_paths, 1):
-        members = _encode_case(_normalize_case(_load_raw(p), recipe),
-                               ks_initial, ks_boundary)
-        dest = out_dir / group[p.stem] / f"{p.stem}.npz"
-        np.savez(dest, **members)
-        written[group[p.stem]].append(dest)
+             "(%d train / %d test, %d workers)", n, len(train_ids), len(test_ids),
+             workers)
+    encode = partial(_encode_file, recipe=recipe, ks_initial=ks_initial,
+                     ks_boundary=ks_boundary)
+    for i, _ in enumerate(_map(encode, jobs, workers), 1):
         if i % 500 == 0 or i == n:
             dt = time.time() - t0
             log.info("encode %d/%d  %.0fs  %.1f cases/s  eta %.0fs",
@@ -243,6 +275,15 @@ def generate(
     _write_metadata(out_dir, recipe, written, test_fraction, seed,
                     ks_initial, ks_boundary)
     return written
+
+
+def _encode_file(job: tuple[Path, Path], recipe: dict, ks_initial: dict,
+                 ks_boundary: dict) -> Path:
+    """Pass 2 for one case: normalize, POD-encode, write to its destination."""
+    src, dest = job
+    np.savez(dest, **_encode_case(_normalize_case(_load_raw(src), recipe),
+                                  ks_initial, ks_boundary))
+    return dest
 
 
 def _svd_encode(mat: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -333,6 +374,8 @@ def main(argv: list[str] | None = None) -> int:
                          "'u=32,v=12,w=110,theta=56'.")
     ap.add_argument("--k-boundary", default="16",
                     help="POD modes for boundary (same format as --k-initial).")
+    ap.add_argument("--workers", type=int, default=1,
+                    help="Processes for both passes (1 = serial).")
     ap.add_argument("-v", "--verbose", action="count", default=0)
     args = ap.parse_args(argv)
 
@@ -343,7 +386,8 @@ def main(argv: list[str] | None = None) -> int:
     written = generate(args.raw_dir, args.out_dir,
                        test_fraction=args.test_fraction, seed=args.seed,
                        ks_initial=_parse_ks(args.k_initial),
-                       ks_boundary=_parse_ks(args.k_boundary))
+                       ks_boundary=_parse_ks(args.k_boundary),
+                       workers=args.workers)
     print(f"Wrote {len(written['train'])} train + {len(written['test'])} test cases "
           f"+ metadata.json to {args.out_dir}")
     return 0
