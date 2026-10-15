@@ -229,3 +229,16 @@ Python with `numpy` and `netCDF4`.
 - **GPU compute** runs the array math on `--device cuda` (see **GPU compute**);
   reads and writes stay on the CPU (I/O-bound). Cutting the case dtype to
   float32 would roughly halve the remaining host-copy + write cost — not yet done.
+
+### Conditional dataset provenance
+
+Conditional generation writes schema version 2 metadata, a SHA256 identifier of
+its metadata contract, split/normalization/POD fit scopes, and source unit labels.
+The identifier does not hash case contents. Pass `units={"u": "m/s", ...}` to
+`conditional_cases.generate`, or `--units units.json` to its CLI. Only supply
+verified source units; unspecified labels remain `unknown`.
+
+The existing numerical pipeline is unchanged: normalization fits all cases,
+including test cases, and the split is seeded random by case. Metadata now
+explicitly discloses these limits; it does not establish independent-regime
+holdouts or training-only preprocessing.

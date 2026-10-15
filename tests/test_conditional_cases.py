@@ -55,7 +55,7 @@ def test_generate_normalizes_and_splits(tmp_path):
         _make_raw(raw / f"sub_{i:02d}.npz", seed=i)
 
     out = tmp_path / "out"
-    written = cc.generate(raw, out, test_fraction=0.2, seed=0)
+    written = cc.generate(raw, out, test_fraction=0.2, seed=0, units={"u": "m/s"})
 
     assert len(written["train"]) == 8 and len(written["test"]) == 2
 
@@ -76,6 +76,17 @@ def test_generate_normalizes_and_splits(tmp_path):
     meta = json.loads((out / "metadata.json").read_text())
     assert meta["normalization"]["method"] == "minmax_01"
     assert meta["schema"]["state_vars"] == list(cc.STATE_VARS)
+    assert meta["schema_version"] == 2
+    assert meta["provenance"]["normalization_fit_scope"] == "all_cases_including_test"
+    assert meta["schema"]["units"]["q_v"] == "unknown"
+    assert meta["schema"]["units"]["u"] == "m/s"
+    assert len(meta["dataset_id"]) == 64
+
+
+@pytest.mark.parametrize("units", [{"typo": "m"}, {"u": 1}, {"u": ""}, ["m"]])
+def test_invalid_units_rejected_before_generation(tmp_path, units):
+    with pytest.raises(ValueError, match="units must map"):
+        cc.generate(tmp_path / "raw", tmp_path / "out", units=units)
 
 
 def test_written_cases_load_in_pinn(tmp_path):

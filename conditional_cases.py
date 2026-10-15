@@ -8,6 +8,7 @@ each. Both passes are per-case, so they run over a process pool (--workers). Rea
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import multiprocessing
 import os
@@ -230,6 +231,7 @@ def generate(
     raw_dir: Path, out_dir: Path, *, test_fraction: float = 0.2, seed: int = 0,
     ks_initial: dict[str, int] | None = None,
     ks_boundary: dict[str, int] | None = None, workers: int = 1,
+    units: dict[str, str] | None = None,
 ) -> dict[str, list[Path]]:
     """Write normalized, POD-encoded cases into out_dir/{train,test} + metadata.json.
 
@@ -238,6 +240,13 @@ def generate(
     ks_* give modes kept per variable. Each case stores, per field/var, its modes,
     mean, and coeffs; the raw state is dropped. workers > 1 runs both passes over
     a process pool; the output is identical to serial."""
+    if units is not None:
+        allowed = set((*COORD_NAMES, *STATE_VARS, *FLUX_VARS))
+        if not isinstance(units, dict) or any(
+            k not in allowed or not isinstance(v, str) or not v.strip()
+            for k, v in units.items()
+        ):
+            raise ValueError("units must map known coordinate/state/flux names to nonempty strings.")
     ks_initial = ks_initial or _default_ks(4)
     ks_boundary = ks_boundary or _default_ks(4)
     raw_dir, out_dir = Path(raw_dir), Path(out_dir)
@@ -277,7 +286,7 @@ def generate(
     log.info("encode pass done in %.0fs", time.time() - t0)
 
     _write_metadata(out_dir, recipe, written, test_fraction, seed,
-                    ks_initial, ks_boundary)
+                    ks_initial, ks_boundary, units)
     return written
 
 
@@ -352,11 +361,14 @@ def _split(ids: list[str], test_fraction: float, seed: int) -> tuple[list[str], 
 
 def _write_metadata(out_dir: Path, recipe: dict, written: dict,
                     test_fraction: float, seed: int,
-                    ks_initial: dict, ks_boundary: dict) -> None:
+                    ks_initial: dict, ks_boundary: dict, units: dict | None = None) -> None:
     meta = {
+        "schema_version": 2,
         "schema": {
             "state_vars": list(STATE_VARS), "coord_names": list(COORD_NAMES),
             "face_names": list(FACE_NAMES), "flux_vars": list(FLUX_VARS),
+            "units": {name: (units or {}).get(name, "unknown")
+                      for name in (*COORD_NAMES, *STATE_VARS, *FLUX_VARS)},
             "surface": "per-snapshot bottom face: columns x,y,t,fricVel,htFlux (normalized)",
             "case_definition": "one sub-domain = (spatial extent, time window)",
             "pod": "per-subdomain; boundary time-SVD per face; initial spatial-SVD "
@@ -367,7 +379,15 @@ def _write_metadata(out_dir: Path, recipe: dict, written: dict,
         "normalization": recipe,
         "pod_modes": {"k_initial": ks_initial, "k_boundary": ks_boundary},
         "cases": {g: [p.stem for p in paths] for g, paths in written.items()},
+        "provenance": {
+            "split_unit": "case", "split_method": "seeded_random",
+            "normalization_fit_scope": "all_cases_including_test",
+            "pod_fit_scope": "per_case_initial_and_boundary",
+            "identity_scope": "metadata contract and case IDs; not a hash of case contents",
+        },
     }
+    meta["dataset_id"] = hashlib.sha256(
+        json.dumps(meta, sort_keys=True, allow_nan=False).encode()).hexdigest()
     (out_dir / "metadata.json").write_text(json.dumps(meta, indent=2))
 
 
@@ -386,6 +406,8 @@ def main(argv: list[str] | None = None) -> int:
                     help="POD modes for boundary (same format as --k-initial).")
     ap.add_argument("--workers", type=int, default=1,
                     help="Processes for both passes (1 = serial).")
+    ap.add_argument("--units", type=Path,
+                    help="JSON object mapping coordinates/state/flux names to source units; omitted units are unknown.")
     ap.add_argument("-v", "--verbose", action="count", default=0)
     args = ap.parse_args(argv)
 
@@ -397,7 +419,8 @@ def main(argv: list[str] | None = None) -> int:
                        test_fraction=args.test_fraction, seed=args.seed,
                        ks_initial=_parse_ks(args.k_initial),
                        ks_boundary=_parse_ks(args.k_boundary),
-                       workers=args.workers)
+                       workers=args.workers,
+                       units=json.loads(args.units.read_text()) if args.units else None)
     print(f"Wrote {len(written['train'])} train + {len(written['test'])} test cases "
           f"+ metadata.json to {args.out_dir}")
     return 0
