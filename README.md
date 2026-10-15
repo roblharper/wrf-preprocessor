@@ -242,3 +242,17 @@ The existing numerical pipeline is unchanged: normalization fits all cases,
 including test cases, and the split is seeded random by case. Metadata now
 explicitly discloses these limits; it does not establish independent-regime
 holdouts or training-only preprocessing.
+
+### Experimental shared training basis
+
+`shared_basis.SharedBasis.fit(training_fields, max_rank=8)` fits a fixed mean
+and orthonormal feature basis across cases. Inputs have shape
+`(case, *field_shape)` on a consistent local grid. `encode()` projects held-out
+fields using the same fitted mean/basis; `decode()` reconstructs them.
+`save()`/`load()` preserve these arrays in NPZ form. Rank zero uses the fixed
+training mean. This module is independent of `conditional_cases.generate` and
+is not wired into the training engine or existing case schema.
+
+The postprocessor `representation_study.py` evaluates this experimental encoder
+on blocked train/test conditioning fields. Field shape alone does not establish
+physical grid compatibility; the study additionally checks relative coordinates.
