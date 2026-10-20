@@ -3,6 +3,10 @@
 Two passes: merge one global min/max recipe over all sub-domains, then normalize
 each. Both passes are per-case, so they run over a process pool (--workers). Reads
 .npz only (no netCDF); source agnostic.
+
+Initial-field encoding (--initial-basis): 'per-case' fits each case its own modes;
+'shared' fits one set of horizontal modes on the train cases (accumulated in pass 1)
+and encodes every case onto it, so the coefficients mean the same map in every case.
 """
 
 from __future__ import annotations
@@ -91,6 +95,55 @@ def _load_raw(path: Path) -> dict[str, np.ndarray]:
     return raw
 
 
+@dataclass
+class _Gram:
+    """Running sum of G^T G per state var, G = a case's initial field (nz, nx*ny)
+    with each level's mean removed. Its top eigenvectors are the shared basis."""
+
+    gram: np.ndarray | None = None          # (n_state, nxy, nxy) float64
+    n_levels: int = 0
+
+    def add(self, grids: np.ndarray) -> None:
+        """grids: (n_state, nz, nxy), level means removed."""
+        g = grids.astype(np.float64)
+        if self.gram is None:
+            self.gram = np.zeros((g.shape[0], g.shape[2], g.shape[2]))
+        if g.shape[2] != self.gram.shape[1]:
+            raise ValueError(f"Shared basis needs one horizontal grid: case has "
+                             f"{g.shape[2]} columns, others {self.gram.shape[1]}.")
+        self.gram += np.einsum("vzi,vzj->vij", g, g)
+        self.n_levels += g.shape[1]
+
+    def basis(self, ks: dict[str, int]) -> dict[str, np.ndarray]:
+        """Top-k eigenvectors per var: {var: (nxy, k)}. Sign fixed so each mode's
+        largest entry is positive (reproducible across platforms)."""
+        out = {}
+        for vj, var in enumerate(STATE_VARS):
+            evals, evecs = np.linalg.eigh(self.gram[vj])
+            order = np.argsort(evals)[::-1]
+            k = ks[var]
+            if not 1 <= k < evecs.shape[0]:
+                raise ValueError(f"k_initial[{var}]={k} must be in [1, {evecs.shape[0] - 1}].")
+            modes = evecs[:, order[:k]]
+            idx = np.abs(modes).argmax(axis=0)
+            modes *= np.sign(modes[idx, np.arange(k)])
+            frac = evals[order[:k]].sum() / max(evals.sum(), 1e-300)
+            log.info("shared basis %s: k=%d holds %.1f%% of train horizontal variance",
+                     var, k, 100 * frac)
+            out[var] = modes.astype(np.float32)
+        return out
+
+
+def _initial_grids(initial: np.ndarray) -> tuple[tuple[int, int, int], np.ndarray]:
+    """initial (n_ic, coords+state) on an x,y-slow z-fast grid -> ((nx, ny, nz),
+    (n_state, nz, nx*ny))."""
+    n_coord = len(COORD_NAMES)
+    nx, ny, nz = (len(np.unique(initial[:, c])) for c in range(3))
+    state = initial[:, n_coord:]
+    grids = state.reshape(nx, ny, nz, -1).transpose(3, 2, 0, 1).reshape(-1, nz, nx * ny)
+    return (nx, ny, nz), grids
+
+
 def _map(fn, items: list, workers: int):
     """Yield fn(item) for every item: in order when serial, as finished in a pool."""
     if workers <= 1:
@@ -100,9 +153,11 @@ def _map(fn, items: list, workers: int):
         yield from pool.imap_unordered(fn, items, chunksize=8)
 
 
-def _case_stats(path: Path) -> _MinMax:
-    """Min/max of one sub-domain. An all-NaN column (e.g. surface has no z) is
+def _case_stats(job: tuple[Path, bool]) -> tuple[_MinMax, np.ndarray | None]:
+    """Min/max of one sub-domain, plus its level-mean-removed initial grids when
+    the case feeds the shared basis. An all-NaN column (e.g. surface has no z) is
     expected and maps to identity."""
+    path, want_grids = job
     n_coord = len(COORD_NAMES)
     stats = _MinMax.empty()
     raw = _load_raw(path)
@@ -117,24 +172,37 @@ def _case_stats(path: Path) -> _MinMax:
         stats.update_coord(raw["boundary_coords"])       # (faces, times, len, coord)
         stats.update_coord(_surface_coords(raw["surface"]))   # surface x,y,t
         stats.update_flux(raw["surface"][..., 3:])            # fricVel, htFlux
-    return stats
+    grids = None
+    if want_grids:
+        # raw units are fine: minmax scales each var by a constant, which leaves
+        # the eigenvectors (the basis) unchanged
+        grids = _initial_grids(raw["initial"])[1].astype(np.float64)
+        if not np.isfinite(grids).all():
+            raise ValueError(f"Non-finite initial field in {path}; shared basis needs it finite.")
+        grids -= grids.mean(axis=2, keepdims=True)
+    return stats, grids
 
 
-def _scan_stats(raw_paths: list[Path], workers: int = 1) -> _MinMax:
-    """Pass 1: merge global min/max over every sub-domain (never holds all at once)."""
-    stats = _MinMax.empty()
+def _scan_stats(raw_paths: list[Path], workers: int = 1,
+                basis_ids: set[str] | frozenset = frozenset()) -> tuple[_MinMax, _Gram]:
+    """Pass 1: merge global min/max over every sub-domain, and the shared-basis
+    Gram over the cases in basis_ids (never holds all at once)."""
+    stats, gram = _MinMax.empty(), _Gram()
     n = len(raw_paths)
     t0 = time.time()
-    log.info("scan pass: reading %d sub-domains for global min/max (%d workers)",
-             n, workers)
-    for i, case in enumerate(_map(_case_stats, raw_paths, workers), 1):
+    log.info("scan pass: reading %d sub-domains for global min/max (%d workers, "
+             "%d feed the shared basis)", n, workers, len(basis_ids))
+    jobs = [(p, p.stem in basis_ids) for p in raw_paths]
+    for i, (case, grids) in enumerate(_map(_case_stats, jobs, workers), 1):
         stats.merge(case)
+        if grids is not None:
+            gram.add(grids)
         if i % 500 == 0 or i == n:
             dt = time.time() - t0
             log.info("scan %d/%d  %.0fs  %.1f cases/s  eta %.0fs",
                      i, n, dt, i / dt, (n - i) / (i / dt))
     log.info("scan pass done in %.0fs", time.time() - t0)
-    return stats
+    return stats, gram
 
 
 def _surface_coords(surface: np.ndarray) -> np.ndarray:
@@ -230,6 +298,7 @@ def generate(
     raw_dir: Path, out_dir: Path, *, test_fraction: float = 0.2, seed: int = 0,
     ks_initial: dict[str, int] | None = None,
     ks_boundary: dict[str, int] | None = None, workers: int = 1,
+    initial_basis: str = "per-case",
 ) -> dict[str, list[Path]]:
     """Write normalized, POD-encoded cases into out_dir/{train,test} + metadata.json.
 
@@ -237,7 +306,14 @@ def generate(
     of each face's (n_times x face_space); initial is a spatial-SVD over z-levels.
     ks_* give modes kept per variable. Each case stores, per field/var, its modes,
     mean, and coeffs; the raw state is dropped. workers > 1 runs both passes over
-    a process pool; the output is identical to serial."""
+    a process pool; the output is identical to serial.
+
+    initial_basis='shared' replaces the initial per-case SVD: one set of horizontal
+    modes Phi (nxy x k) is fit on the train cases only, and each level is stored as
+    its mean m plus a = Phi^T (x - m). Each case keeps the decode contract (modes =
+    [1 | Phi], coeffs = [m | a], mean = 0); Phi is also written to shared_basis.npz."""
+    if initial_basis not in ("per-case", "shared"):
+        raise ValueError(f"initial_basis must be 'per-case' or 'shared', got {initial_basis!r}.")
     ks_initial = ks_initial or _default_ks(4)
     ks_boundary = ks_boundary or _default_ks(4)
     raw_dir, out_dir = Path(raw_dir), Path(out_dir)
@@ -246,10 +322,18 @@ def generate(
         raise FileNotFoundError(f"No raw sub-domain .npz files in {raw_dir}.")
     log.info("found %d raw sub-domains", len(raw_paths))
 
-    recipe = _norm_recipe(_scan_stats(raw_paths, workers))
-
     ids = [p.stem for p in raw_paths]
     train_ids, test_ids = _split(ids, test_fraction, seed)
+    shared = initial_basis == "shared"
+    if shared and not train_ids:
+        raise ValueError("Shared basis is fit on train cases, but the split has none.")
+    stats, gram = _scan_stats(raw_paths, workers, set(train_ids) if shared else set())
+    recipe = _norm_recipe(stats)
+    basis = None
+    if shared:
+        basis = gram.basis(ks_initial)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        np.savez(out_dir / "shared_basis.npz", **{f"modes_{v}": m for v, m in basis.items()})
     group = {i: "train" for i in train_ids} | {i: "test" for i in test_ids}
     for g in ("train", "test"):
         (out_dir / g).mkdir(parents=True, exist_ok=True)
@@ -268,7 +352,7 @@ def generate(
              "(%d train / %d test, %d workers, %d already written)",
              n, len(train_ids), len(test_ids), workers, n_done)
     encode = partial(_encode_file, recipe=recipe, ks_initial=ks_initial,
-                     ks_boundary=ks_boundary)
+                     ks_boundary=ks_boundary, basis=basis)
     for i, _ in enumerate(_map(encode, jobs, workers), 1):
         if i % 500 == 0 or i == n:
             dt = time.time() - t0
@@ -277,12 +361,14 @@ def generate(
     log.info("encode pass done in %.0fs", time.time() - t0)
 
     _write_metadata(out_dir, recipe, written, test_fraction, seed,
-                    ks_initial, ks_boundary)
+                    ks_initial, ks_boundary,
+                    {"kind": initial_basis, "fit_cases": len(train_ids) if shared else 0,
+                     "file": "shared_basis.npz" if shared else None})
     return written
 
 
 def _encode_file(job: tuple[Path, Path], recipe: dict, ks_initial: dict,
-                 ks_boundary: dict) -> Path:
+                 ks_boundary: dict, basis: dict | None = None) -> Path:
     """Pass 2 for one case: normalize, POD-encode, write to its destination.
     Skips a case already written; writes via a temp name so a killed job never
     leaves a half-written case."""
@@ -291,7 +377,7 @@ def _encode_file(job: tuple[Path, Path], recipe: dict, ks_initial: dict,
         return dest
     tmp = dest.with_name(dest.stem + ".tmp.npz")
     np.savez(tmp, **_encode_case(_normalize_case(_load_raw(src), recipe),
-                                 ks_initial, ks_boundary))
+                                 ks_initial, ks_boundary, basis))
     os.replace(tmp, dest)
     return dest
 
@@ -309,9 +395,11 @@ def _svd_encode(mat: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray, np.nda
             coeffs.astype(np.float32))
 
 
-def _encode_case(members: dict, ks_initial: dict, ks_boundary: dict) -> dict:
+def _encode_case(members: dict, ks_initial: dict, ks_boundary: dict,
+                 basis: dict | None = None) -> dict:
     """Per-subdomain POD encode. Boundary: per face, time-SVD. Initial: spatial-SVD
-    over z-levels. Store modes/mean/coeffs per field/var; drop raw state."""
+    over z-levels, or projection onto the shared basis when given. Store
+    modes/mean/coeffs per field/var; drop raw state."""
     n_coord = len(COORD_NAMES)
     out = {k: members[k] for k in
            ("boundary_coords", "terrain", "interior", "targets", "target_mask",
@@ -329,18 +417,30 @@ def _encode_case(members: dict, ks_initial: dict, ks_boundary: dict) -> dict:
             out[f"bnd_coeffs_{var}_{face}"] = coeffs
 
     # --- initial: reshape to (nz, nx*ny), spatial-SVD over z-levels per var ---
-    init = members["initial"]
-    nx = len(np.unique(init[:, 0])); ny = len(np.unique(init[:, 1]))
-    nz = len(np.unique(init[:, 2]))
+    (nx, ny, nz), grids = _initial_grids(members["initial"])
     out["initial_grid"] = np.array([nx, ny, nz], dtype=np.int64)
-    state = init[:, n_coord:]
     for vj, var in enumerate(STATE_VARS):
-        grid = state[:, vj].reshape(nx, ny, nz).transpose(2, 0, 1).reshape(nz, nx * ny)
-        mean, modes, coeffs = _svd_encode(grid, ks_initial[var])
+        if basis is None:
+            mean, modes, coeffs = _svd_encode(grids[vj], ks_initial[var])
+        else:
+            mean, modes, coeffs = _shared_encode(grids[vj], basis[var])
         out[f"ini_mean_{var}"] = mean
         out[f"ini_modes_{var}"] = modes
         out[f"ini_coeffs_{var}"] = coeffs
     return out
+
+
+def _shared_encode(grid: np.ndarray, phi: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """grid (nz, nxy) onto shared modes phi (nxy, k): per level, mean m and
+    a = (x - m) @ phi. Returned in the per-case layout so decode is unchanged:
+    mean 0, modes [1 | phi], coeffs [m | a]."""
+    g = grid.astype(np.float64)
+    m = g.mean(axis=1, keepdims=True)
+    a = (g - m) @ phi
+    nxy = grid.shape[1]
+    modes = np.concatenate([np.ones((nxy, 1)), phi], axis=1)
+    return (np.zeros(nxy, np.float32), modes.astype(np.float32),
+            np.concatenate([m, a], axis=1).astype(np.float32))
 
 
 def _split(ids: list[str], test_fraction: float, seed: int) -> tuple[list[str], list[str]]:
@@ -352,7 +452,7 @@ def _split(ids: list[str], test_fraction: float, seed: int) -> tuple[list[str], 
 
 def _write_metadata(out_dir: Path, recipe: dict, written: dict,
                     test_fraction: float, seed: int,
-                    ks_initial: dict, ks_boundary: dict) -> None:
+                    ks_initial: dict, ks_boundary: dict, initial_basis: dict) -> None:
     meta = {
         "schema": {
             "state_vars": list(STATE_VARS), "coord_names": list(COORD_NAMES),
@@ -366,6 +466,7 @@ def _write_metadata(out_dir: Path, recipe: dict, written: dict,
         "split": {"test_fraction": test_fraction, "seed": seed},
         "normalization": recipe,
         "pod_modes": {"k_initial": ks_initial, "k_boundary": ks_boundary},
+        "initial_basis": initial_basis,
         "cases": {g: [p.stem for p in paths] for g, paths in written.items()},
     }
     (out_dir / "metadata.json").write_text(json.dumps(meta, indent=2))
@@ -384,6 +485,9 @@ def main(argv: list[str] | None = None) -> int:
                          "'u=32,v=12,w=110,theta=56'.")
     ap.add_argument("--k-boundary", default="16",
                     help="POD modes for boundary (same format as --k-initial).")
+    ap.add_argument("--initial-basis", choices=("per-case", "shared"), default="per-case",
+                    help="Initial-field modes: fit per case, or one shared basis fit "
+                         "on the train cases (--k-initial modes per var).")
     ap.add_argument("--workers", type=int, default=1,
                     help="Processes for both passes (1 = serial).")
     ap.add_argument("-v", "--verbose", action="count", default=0)
@@ -397,7 +501,7 @@ def main(argv: list[str] | None = None) -> int:
                        test_fraction=args.test_fraction, seed=args.seed,
                        ks_initial=_parse_ks(args.k_initial),
                        ks_boundary=_parse_ks(args.k_boundary),
-                       workers=args.workers)
+                       workers=args.workers, initial_basis=args.initial_basis)
     print(f"Wrote {len(written['train'])} train + {len(written['test'])} test cases "
           f"+ metadata.json to {args.out_dir}")
     return 0
