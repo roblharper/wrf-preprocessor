@@ -7,6 +7,11 @@ each. Both passes are per-case, so they run over a process pool (--workers). Rea
 Initial-field encoding (--initial-basis): 'per-case' fits each case its own modes;
 'shared' fits one set of horizontal modes on the train cases (accumulated in pass 1)
 and encodes every case onto it, so the coefficients mean the same map in every case.
+
+--keep-raw also stores the normalized initial and boundary fields themselves
+(ini_raw, bnd_raw) next to the POD pieces. --recipe-from reuses another dataset's
+normalization and train/test assignment (skips pass 1), so a re-carved subset
+scores against the same test cases.
 """
 
 from __future__ import annotations
@@ -298,7 +303,8 @@ def generate(
     raw_dir: Path, out_dir: Path, *, test_fraction: float = 0.2, seed: int = 0,
     ks_initial: dict[str, int] | None = None,
     ks_boundary: dict[str, int] | None = None, workers: int = 1,
-    initial_basis: str = "per-case",
+    initial_basis: str = "per-case", keep_raw: bool = False,
+    recipe_from: Path | None = None,
 ) -> dict[str, list[Path]]:
     """Write normalized, POD-encoded cases into out_dir/{train,test} + metadata.json.
 
@@ -311,7 +317,11 @@ def generate(
     initial_basis='shared' replaces the initial per-case SVD: one set of horizontal
     modes Phi (nxy x k) is fit on the train cases only, and each level is stored as
     its mean m plus a = Phi^T (x - m). Each case keeps the decode contract (modes =
-    [1 | Phi], coeffs = [m | a], mean = 0); Phi is also written to shared_basis.npz."""
+    [1 | Phi], coeffs = [m | a], mean = 0); Phi is also written to shared_basis.npz.
+
+    keep_raw adds ini_raw (n_state, nz, nx*ny) and bnd_raw (n_faces, n_times,
+    face_len, n_state), normalized. recipe_from (a metadata.json) supplies the
+    normalization and each case's train/test group instead of computing them."""
     if initial_basis not in ("per-case", "shared"):
         raise ValueError(f"initial_basis must be 'per-case' or 'shared', got {initial_basis!r}.")
     ks_initial = ks_initial or _default_ks(4)
@@ -323,12 +333,27 @@ def generate(
     log.info("found %d raw sub-domains", len(raw_paths))
 
     ids = [p.stem for p in raw_paths]
-    train_ids, test_ids = _split(ids, test_fraction, seed)
     shared = initial_basis == "shared"
-    if shared and not train_ids:
-        raise ValueError("Shared basis is fit on train cases, but the split has none.")
-    stats, gram = _scan_stats(raw_paths, workers, set(train_ids) if shared else set())
-    recipe = _norm_recipe(stats)
+    if recipe_from is not None:
+        if shared:
+            raise ValueError("recipe_from skips pass 1, which the shared basis needs.")
+        src = json.loads(Path(recipe_from).read_text())
+        group_of = {i: g for g in ("train", "test") for i in src["cases"][g]}
+        unknown = [i for i in ids if i not in group_of]
+        if unknown:
+            raise ValueError(f"{len(unknown)} cases not in {recipe_from}, e.g. {unknown[:3]}.")
+        train_ids = [i for i in ids if group_of[i] == "train"]
+        test_ids = [i for i in ids if group_of[i] == "test"]
+        recipe = src["normalization"]
+        test_fraction, seed = src["split"]["test_fraction"], src["split"]["seed"]
+        log.info("recipe and split from %s: %d train / %d test", recipe_from,
+                 len(train_ids), len(test_ids))
+    else:
+        train_ids, test_ids = _split(ids, test_fraction, seed)
+        if shared and not train_ids:
+            raise ValueError("Shared basis is fit on train cases, but the split has none.")
+        stats, gram = _scan_stats(raw_paths, workers, set(train_ids) if shared else set())
+        recipe = _norm_recipe(stats)
     basis = None
     if shared:
         basis = gram.basis(ks_initial)
@@ -352,7 +377,7 @@ def generate(
              "(%d train / %d test, %d workers, %d already written)",
              n, len(train_ids), len(test_ids), workers, n_done)
     encode = partial(_encode_file, recipe=recipe, ks_initial=ks_initial,
-                     ks_boundary=ks_boundary, basis=basis)
+                     ks_boundary=ks_boundary, basis=basis, keep_raw=keep_raw)
     for i, _ in enumerate(_map(encode, jobs, workers), 1):
         if i % 500 == 0 or i == n:
             dt = time.time() - t0
@@ -363,12 +388,13 @@ def generate(
     _write_metadata(out_dir, recipe, written, test_fraction, seed,
                     ks_initial, ks_boundary,
                     {"kind": initial_basis, "fit_cases": len(train_ids) if shared else 0,
-                     "file": "shared_basis.npz" if shared else None})
+                     "file": "shared_basis.npz" if shared else None}, keep_raw)
     return written
 
 
 def _encode_file(job: tuple[Path, Path], recipe: dict, ks_initial: dict,
-                 ks_boundary: dict, basis: dict | None = None) -> Path:
+                 ks_boundary: dict, basis: dict | None = None,
+                 keep_raw: bool = False) -> Path:
     """Pass 2 for one case: normalize, POD-encode, write to its destination.
     Skips a case already written; writes via a temp name so a killed job never
     leaves a half-written case."""
@@ -377,7 +403,7 @@ def _encode_file(job: tuple[Path, Path], recipe: dict, ks_initial: dict,
         return dest
     tmp = dest.with_name(dest.stem + ".tmp.npz")
     np.savez(tmp, **_encode_case(_normalize_case(_load_raw(src), recipe),
-                                 ks_initial, ks_boundary, basis))
+                                 ks_initial, ks_boundary, basis, keep_raw))
     os.replace(tmp, dest)
     return dest
 
@@ -396,10 +422,10 @@ def _svd_encode(mat: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray, np.nda
 
 
 def _encode_case(members: dict, ks_initial: dict, ks_boundary: dict,
-                 basis: dict | None = None) -> dict:
+                 basis: dict | None = None, keep_raw: bool = False) -> dict:
     """Per-subdomain POD encode. Boundary: per face, time-SVD. Initial: spatial-SVD
     over z-levels, or projection onto the shared basis when given. Store
-    modes/mean/coeffs per field/var; drop raw state."""
+    modes/mean/coeffs per field/var; drop raw state unless keep_raw."""
     n_coord = len(COORD_NAMES)
     out = {k: members[k] for k in
            ("boundary_coords", "terrain", "interior", "targets", "target_mask",
@@ -427,6 +453,9 @@ def _encode_case(members: dict, ks_initial: dict, ks_boundary: dict,
         out[f"ini_mean_{var}"] = mean
         out[f"ini_modes_{var}"] = modes
         out[f"ini_coeffs_{var}"] = coeffs
+    if keep_raw:
+        out["ini_raw"] = grids.astype(np.float32)        # (n_state, nz, nx*ny)
+        out["bnd_raw"] = bnd.astype(np.float32)          # (n_faces, n_times, face_len, n_state)
     return out
 
 
@@ -452,7 +481,8 @@ def _split(ids: list[str], test_fraction: float, seed: int) -> tuple[list[str], 
 
 def _write_metadata(out_dir: Path, recipe: dict, written: dict,
                     test_fraction: float, seed: int,
-                    ks_initial: dict, ks_boundary: dict, initial_basis: dict) -> None:
+                    ks_initial: dict, ks_boundary: dict, initial_basis: dict,
+                    keep_raw: bool = False) -> None:
     meta = {
         "schema": {
             "state_vars": list(STATE_VARS), "coord_names": list(COORD_NAMES),
@@ -462,6 +492,8 @@ def _write_metadata(out_dir: Path, recipe: dict, written: dict,
             "pod": "per-subdomain; boundary time-SVD per face; initial spatial-SVD "
                    "over z. Per field/var: {mean, modes, coeffs}; decode = "
                    "mean + coeffs @ modes.T.",
+            "raw": "ini_raw (n_state, nz, nx*ny) and bnd_raw (n_faces, n_times, "
+                   "face_len, n_state), normalized" if keep_raw else None,
         },
         "split": {"test_fraction": test_fraction, "seed": seed},
         "normalization": recipe,
@@ -488,6 +520,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--initial-basis", choices=("per-case", "shared"), default="per-case",
                     help="Initial-field modes: fit per case, or one shared basis fit "
                          "on the train cases (--k-initial modes per var).")
+    ap.add_argument("--keep-raw", action="store_true",
+                    help="Also store the normalized initial and boundary fields.")
+    ap.add_argument("--recipe-from", type=Path, default=None,
+                    help="metadata.json whose normalization and train/test groups to reuse.")
     ap.add_argument("--workers", type=int, default=1,
                     help="Processes for both passes (1 = serial).")
     ap.add_argument("-v", "--verbose", action="count", default=0)
@@ -501,7 +537,8 @@ def main(argv: list[str] | None = None) -> int:
                        test_fraction=args.test_fraction, seed=args.seed,
                        ks_initial=_parse_ks(args.k_initial),
                        ks_boundary=_parse_ks(args.k_boundary),
-                       workers=args.workers, initial_basis=args.initial_basis)
+                       workers=args.workers, initial_basis=args.initial_basis,
+                       keep_raw=args.keep_raw, recipe_from=args.recipe_from)
     print(f"Wrote {len(written['train'])} train + {len(written['test'])} test cases "
           f"+ metadata.json to {args.out_dir}")
     return 0

@@ -175,3 +175,57 @@ def test_shared_basis_loads_in_pinn(tmp_path):
 def test_shared_basis_rejects_k_too_large(tmp_path):
     with pytest.raises(ValueError, match="k_initial"):
         _shared(tmp_path, k=9)                                   # grid has 9 columns
+
+
+def test_keep_raw_stores_normalized_fields(tmp_path):
+    """--keep-raw writes the initial and boundary fields themselves, normalized by
+    the same recipe as targets, alongside the unchanged POD pieces."""
+    raw = tmp_path / "raw"; raw.mkdir()
+    for i in range(5):
+        _make_raw(raw / f"sub_{i:02d}.npz", seed=i)
+    pod = cc.generate(raw, tmp_path / "pod", test_fraction=0.2, seed=0)
+    kept = cc.generate(raw, tmp_path / "kept", test_fraction=0.2, seed=0, keep_raw=True)
+    recipe = json.loads((tmp_path / "kept" / "metadata.json").read_text())["normalization"]
+    off, scale = np.array(recipe["state_offset"]), np.array(recipe["state_scale"])
+    for p_pod, p_kept in zip(pod["train"] + pod["test"], kept["train"] + kept["test"]):
+        src = np.load(raw / p_kept.name)
+        with np.load(p_pod) as a, np.load(p_kept) as b:
+            for k in a.files:
+                np.testing.assert_array_equal(a[k], b[k], err_msg=k)
+            want_bnd = (src["boundary"] - off) / scale
+            np.testing.assert_allclose(b["bnd_raw"], want_bnd, rtol=1e-5, atol=1e-6)
+            grids = cc._initial_grids(src["initial"])[1]           # (n_state, nz, nxy)
+            want_ini = (grids - off[:, None, None]) / scale[:, None, None]
+            np.testing.assert_allclose(b["ini_raw"], want_ini, rtol=1e-5, atol=1e-6)
+
+
+def test_recipe_from_reuses_normalization_and_split(tmp_path):
+    """A subset re-run with recipe_from keeps the full run's recipe and puts each
+    case in the same group, so test scores stay comparable."""
+    raw = tmp_path / "raw"; raw.mkdir()
+    for i in range(10):
+        _make_raw(raw / f"sub_{i:02d}.npz", seed=i)
+    full = cc.generate(raw, tmp_path / "full", test_fraction=0.3, seed=1)
+    sub = tmp_path / "sub"; sub.mkdir()
+    for i in (1, 4, 6, 9):
+        (sub / f"sub_{i:02d}.npz").write_bytes((raw / f"sub_{i:02d}.npz").read_bytes())
+    meta_full = tmp_path / "full" / "metadata.json"
+    part = cc.generate(sub, tmp_path / "part", recipe_from=meta_full, keep_raw=True)
+    full_meta = json.loads(meta_full.read_text())
+    part_meta = json.loads((tmp_path / "part" / "metadata.json").read_text())
+    assert part_meta["normalization"] == full_meta["normalization"]
+    for g in ("train", "test"):
+        assert {p.stem for p in part[g]} == {p.stem for p in full[g]} & {p.stem for p in part["train"] + part["test"]}
+        for p in part[g]:
+            with np.load(p) as a, np.load(tmp_path / "full" / g / p.name) as b:
+                np.testing.assert_array_equal(a["targets"], b["targets"])
+
+
+def test_recipe_from_rejects_unknown_cases(tmp_path):
+    raw = tmp_path / "raw"; raw.mkdir()
+    for i in range(3):
+        _make_raw(raw / f"sub_{i:02d}.npz", seed=i)
+    cc.generate(raw, tmp_path / "full", test_fraction=0.3, seed=0)
+    _make_raw(raw / "extra.npz", seed=7)
+    with pytest.raises(ValueError, match="not in"):
+        cc.generate(raw, tmp_path / "again", recipe_from=tmp_path / "full" / "metadata.json")
